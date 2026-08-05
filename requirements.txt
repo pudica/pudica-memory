@@ -1,0 +1,21 @@
+# pudica-Memory 运行时依赖
+# Python >= 3.11
+# 安装: pip install -r requirements.txt
+#
+# 注意：嵌入模型使用本地 ONNX bge-small-zh-v1.5（models/ 目录，免下载、免 torch），
+# 不需要安装 sentence-transformers（其会连带安装 ~2.5GB 的 torch）。
+
+fastmcp>=3.4.2
+chromadb>=1.5.0
+aiosqlite>=0.20.0
+httpx>=0.27.0
+
+# 本地 ONNX 中文嵌入器（bge-small-zh-v1.5 int8 量化版，CPU 可跑）
+onnxruntime>=1.20.0
+tokenizers>=0.19.0
+numpy>=1.24.0
+tqdm>=4.60.0
+
+# HTTP API 可选
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0

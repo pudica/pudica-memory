@@ -1,0 +1,25 @@
+# 运行时数据
+data/
+chroma/
+*.db
+
+# 模型文件
+models/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 系统
+.DS_Store
+Thumbs.db
+*.log
