@@ -91,7 +91,16 @@ class LLMClient:
             resp = await self._client.post(self._endpoint, json=body)
             resp.raise_for_status()
             data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            if not isinstance(data, dict):
+                raise ValueError(f"LLM 返回非 JSON 对象: {type(data).__name__}")
+            choices = data.get("choices")
+            if not choices:
+                raise ValueError(f"LLM 返回空的 choices: {data}")
+            message = choices[0].get("message", {})
+            content = message.get("content", "")
+            if not content:
+                logger.warning("LLM 返回空内容: %s", data)
+            return content
         except Exception as e:
             logger.error("LLM 调用失败: %s", e)
             raise
@@ -135,40 +144,45 @@ class UnifiedMemoryApp:
         self.llm = LLMClient(self.config.llm)
         logger.info("  LLM 客户端: %s (%s)", self.config.llm.model, self.config.llm.api_base)
 
-        # 2. SQLite 存储
-        self.pool = SQLitePool(
-            db_path=self.config.sqlite.db_path,
-            maxsize=self.config.sqlite.pool_size,
-            timeout=self.config.sqlite.timeout,
-        )
-        await self.pool.initialize()
-        logger.info("  SQLite 池: %s (pool=%d)", self.config.sqlite.db_path, self.config.sqlite.pool_size)
-
-        # 3. ChromaDB 向量存储
-        self.chroma = ChromaStore(
-            persist_dir=self.config.chroma.persist_dir,
-            collection_name=self.config.chroma.collection_name,
-        )
-        self.chroma._ensure_collection()
-        logger.info("  ChromaDB: %s (collection=%s)", self.config.chroma.persist_dir, self.config.chroma.collection_name)
-
-        # 4. 知识图谱
-        self.kg = KnowledgeGraph(pool=self.pool)
-        await self.kg.load_from_db()
-        logger.info("  知识图谱: %d 实体, %d 关系 (LRU cache=%d)", len(self.kg._all_entity_names), len(self.kg._relations), len(self.kg._entities))
-
-        # 4b. 心智模型（Hindsight: Mental Models）
-        if self.config.mental_model.enabled:
-            self.mental_models = MentalModelStore(
-                pool=self.pool,
-                settings={
-                    "belief_update_threshold": self.config.mental_model.belief_update_threshold,
-                    "max_beliefs": self.config.mental_model.max_beliefs,
-                    "belief_ttl": self.config.mental_model.belief_ttl,
-                },
+        try:
+            # 2. SQLite 存储
+            self.pool = SQLitePool(
+                db_path=self.config.sqlite.db_path,
+                maxsize=self.config.sqlite.pool_size,
+                timeout=self.config.sqlite.timeout,
             )
-            await self.mental_models.load_from_db()
-            logger.info("  心智模型: %d 条信念", self.mental_models.get_stats()["total"])
+            await self.pool.initialize()
+            logger.info("  SQLite 池: %s (pool=%d)", self.config.sqlite.db_path, self.config.sqlite.pool_size)
+
+            # 3. ChromaDB 向量存储
+            self.chroma = ChromaStore(
+                persist_dir=self.config.chroma.persist_dir,
+                collection_name=self.config.chroma.collection_name,
+            )
+            self.chroma._ensure_collection()
+            logger.info("  ChromaDB: %s (collection=%s)", self.config.chroma.persist_dir, self.config.chroma.collection_name)
+
+            # 4. 知识图谱
+            self.kg = KnowledgeGraph(pool=self.pool)
+            await self.kg.load_from_db()
+            logger.info("  知识图谱: %d 实体, %d 关系 (LRU cache=%d)", len(self.kg._all_entity_names), len(self.kg._relations), len(self.kg._entities))
+
+            # 4b. 心智模型（Hindsight: Mental Models）
+            if self.config.mental_model.enabled:
+                self.mental_models = MentalModelStore(
+                    pool=self.pool,
+                    settings={
+                        "belief_update_threshold": self.config.mental_model.belief_update_threshold,
+                        "max_beliefs": self.config.mental_model.max_beliefs,
+                        "belief_ttl": self.config.mental_model.belief_ttl,
+                    },
+                )
+                await self.mental_models.load_from_db()
+                logger.info("  心智模型: %d 条信念", self.mental_models.get_stats()["total"])
+        except Exception:
+            # Bug fix: 初始化失败时关闭 LLM 的 httpx AsyncClient，防止 HTTP 连接泄漏。
+            await self.llm.close()
+            raise
 
         # 4c. 重排器（Hindsight: Cross-Encoder）
         if self.config.reranker.enabled:
@@ -239,7 +253,7 @@ class UnifiedMemoryApp:
             reflect_interval_hours=24,
             consolidate_interval_hours=4,
             compressor=self.compressor,
-            compress_interval_hours=self.config.compression.interval // 3600 if self.config.compression.enabled else 24,
+            compress_interval_hours=max(1, self.config.compression.interval // 3600) if self.config.compression.enabled else 24,
         )
         await self.scheduler.start()
         logger.info("  调度器: reflect=24h, consolidate=4h" +
@@ -297,10 +311,12 @@ class UnifiedMemoryApp:
         if self.pipeline:
             await self.pipeline.stop()  # stop() 内部已刷盘
         if self.chroma:
-            self.chroma._ensure_client()
             # 释放 ChromaDB 客户端资源（SQLite 句柄 + 线程池）
             # 注意：不要调用 client.reset() —— 它清空整个向量库（且 1.5.9 默认禁用）
             try:
+                # Bug fix: _ensure_client() 现在包裹在 try 内，防止 ChromaDB
+                # 处于异常状态时 shutdown 流程被意外中断。
+                self.chroma._ensure_client()
                 close = getattr(self.chroma._client, "close", None)
                 if callable(close):
                     close()
@@ -309,6 +325,9 @@ class UnifiedMemoryApp:
             finally:
                 self.chroma._client = None
                 self.chroma._collection = None
+            # Bug fix: 关闭 ChromaDB 专用线程池（防止 ResourceWarning）
+            from unified_memory.store.chroma_store import shutdown_chroma_executor
+            shutdown_chroma_executor()
         if self.pool:
             await self.pool.close()
         if self.llm:

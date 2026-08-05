@@ -274,9 +274,15 @@ class MentalModelStore:
 
     @staticmethod
     def _text_similarity(a: str, b: str) -> float:
-        """计算两段文本的 Jaccard 相似度（基于 token 集合）。
+        """计算两段文本的 Jaccard 相似度（基于 bigram 集合）。
 
         用于判断新证据是支持还是矛盾已有信念。
+
+        Bug fix: 从词级/字级混合 token 改为 bigram Jaccard。
+        原实现将 split() 的整体词（中文无空格时为整句）和逐汉字
+        混在同一个集合中，导致 Jaccard 相似度偏差（长 token 稀释
+        短 token 的贡献）。bigram 统一保留字符顺序信息，与
+        consolidation.py 的 _name_similarity 保持一致。
 
         Args:
             a: 文本 A
@@ -287,24 +293,18 @@ class MentalModelStore:
         """
         if not a or not b:
             return 0.0
-        # 分词：中文按字，英文按空格
-        tokens_a: set[str] = set()
-        for word in a.split():
-            w = word.strip().lower()
-            if w:
-                tokens_a.add(w)
-        for c in a:
-            if "\u4e00" <= c <= "\u9fff":
-                tokens_a.add(c)
+        if a == b:
+            return 1.0
 
-        tokens_b: set[str] = set()
-        for word in b.split():
-            w = word.strip().lower()
-            if w:
-                tokens_b.add(w)
-        for c in b:
-            if "\u4e00" <= c <= "\u9fff":
-                tokens_b.add(c)
+        # Bigram 切分（保留字符顺序）
+        def bigrams(s: str) -> set[str]:
+            chars = s.strip().lower()
+            if len(chars) < 2:
+                return {chars}
+            return {chars[i:i + 2] for i in range(len(chars) - 1)}
+
+        tokens_a = bigrams(a)
+        tokens_b = bigrams(b)
 
         if not tokens_a or not tokens_b:
             return 0.0
@@ -371,9 +371,12 @@ class MentalModelStore:
                 if b.confidence < 0.1
             ]
             for k in to_remove:
+                # Bug fix: 必须在 del 之前取出 belief.id（UUID），
+                # 不能把 cache_key（如 "preference:中医偏好"）传给
+                # _delete_belief_from_db，后者用 WHERE id = ? 匹配 UUID。
+                belief_id = self._cache[k].id
                 del self._cache[k]
-                # 从数据库删除
-                await self._delete_belief_from_db(k)
+                await self._delete_belief_from_db(belief_id)
 
             logger.info("信念衰减完成: %d 条衰减, %d 条清理", count, len(to_remove))
             return count

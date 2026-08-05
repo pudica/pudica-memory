@@ -41,12 +41,20 @@ class L2SceneOrganizer:
             return None
 
         # 1. 更新知识图谱实体和关系
+        # Bug fix: 添加 entity dict 格式验证，防止 LLM 提取的非标准格式
+        # 导致 entity["name"] / entity["type"] 抛出 TypeError
         for entity in extracted.get("entities", []):
-            await self._kg.add_entity(entity["name"], entity["type"])
+            if not isinstance(entity, dict) or "name" not in entity:
+                logger.debug("跳过格式异常的实体: %s", entity)
+                continue
+            await self._kg.add_entity(entity["name"], entity.get("type", "unknown"))
 
         for rel in extracted.get("relations", []):
+            if not isinstance(rel, dict):
+                logger.debug("跳过格式异常的关系: %s", rel)
+                continue
             await self._kg.add_relation(
-                rel["subject"], rel["predicate"], rel["object"]
+                rel.get("subject", ""), rel.get("predicate", ""), rel.get("object", "")
             )
 
         # 2. 场景归类（返回场景 ID 和是否新建的标志）
@@ -76,7 +84,11 @@ class L2SceneOrganizer:
         # 默认使用第一个实体的名称作为场景名
         scene_name = "general"
         if extracted.get("entities"):
-            scene_name = extracted["entities"][0]["name"]
+            first = extracted["entities"][0]
+            if isinstance(first, dict) and "name" in first:
+                scene_name = first["name"]
+            elif isinstance(first, str):
+                scene_name = first
 
         scene_id = str(uuid4())
         now = time.time()

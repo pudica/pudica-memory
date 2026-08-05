@@ -156,8 +156,18 @@ class PipelineEngine:
         }
 
         # MemPalace: Verbatim 逐字存储（在管线处理前保存原始输入）
+        # Bug fix: 使用 create_task 异步执行，避免 DB 连接池耗尽时阻塞 ingest 管线。
+        # Verbatim 存储是"尽力而为"的辅助功能，不应阻塞核心管线。
+        # Bug fix v2: 添加 done_callback 捕获静默异常，防止 fire-and-forget
+        # 任务中的异常仅进入 asyncio 默认 handler 而未被日志捕获。
         if self._verbatim_enabled:
-            await self._store_verbatim(msg_id, content, source, metadata)
+            task = asyncio.create_task(
+                self._store_verbatim(msg_id, content, source, metadata)
+            )
+            task.add_done_callback(
+                lambda t: logger.warning("Verbatim 存储异常: %s", t.exception())
+                if not t.cancelled() and t.exception() else None
+            )
 
         # 在锁内把消息加入 buffer，避免与 _flush_loop / _idle_flush_task 竞态
         async with self._lock:
@@ -289,8 +299,15 @@ class PipelineEngine:
             for attempt in range(2):
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(None, self._chroma.add_batch, chroma_items)
+                    # Bug fix: 使用 ChromaDB 专用线程池 + 超时，防止与默认线程池竞争死锁。
+                    from unified_memory.store.chroma_store import get_chroma_executor
+                    chroma_future = loop.run_in_executor(
+                        get_chroma_executor(), self._chroma.add_batch, chroma_items,
+                    )
+                    await asyncio.wait_for(chroma_future, timeout=30.0)
                     break
+                except asyncio.TimeoutError:
+                    logger.warning("ChromaDB 写入超时（attempt %d），线程池可能耗尽", attempt + 1)
                 except Exception as e:
                     if attempt == 0:
                         logger.warning("ChromaDB 写入失败，重试: %s", e)
@@ -436,33 +453,42 @@ class PipelineEngine:
             if not summary:
                 continue
 
+            # Bug fix: 验证 entities 列表中每一项是否为 dict 并包含 "name" 键。
+            # L1 extractor 可能返回字符串、缺少 key 的 dict 等非标准格式。
+            valid_entity_names: list[str] = []
+            for entity in entities:
+                if isinstance(entity, dict) and "name" in entity:
+                    valid_entity_names.append(entity["name"])
+                elif isinstance(entity, str):
+                    valid_entity_names.append(entity)
+
             # 根据事实类型推断心智模型类别
             if fact_type == "opinion":
                 # 偏好类：从摘要中提取关键偏好
-                for entity in entities[:3]:
+                for ename in valid_entity_names[:3]:
                     await self._mental_models.upsert_belief(
                         category="preference",
-                        key=entity["name"],
+                        key=ename,
                         value=summary[:100],
                         source_memory_id=msg_id,
                         confidence_delta=0.15,
                     )
             elif fact_type == "experience":
                 # 行为类：记录用户做过的事
-                for entity in entities[:3]:
+                for ename in valid_entity_names[:3]:
                     await self._mental_models.upsert_belief(
                         category="behavior",
-                        key=entity["name"],
+                        key=ename,
                         value=summary[:100],
                         source_memory_id=msg_id,
                         confidence_delta=0.1,
                     )
             elif fact_type == "world":
                 # 信念类：用户持有的知识/观点
-                for entity in entities[:2]:
+                for ename in valid_entity_names[:2]:
                     await self._mental_models.upsert_belief(
                         category="belief",
-                        key=entity["name"],
+                        key=ename,
                         value=summary[:100],
                         source_memory_id=msg_id,
                         confidence_delta=0.1,

@@ -129,9 +129,11 @@ class Consolidator:
     async def _reassign_relations(self, from_entity: str, to_entity: str) -> None:
         """将 from_entity 的所有关系重新指向 to_entity，然后删除 from_entity。"""
         # 第一步：先持久化到 DB（成功后才更新内存，避免不一致）
+        # Bug fix: 使用显式事务确保多步 DML 原子性，防止崩溃导致数据不一致
         if self._pool:
             conn = await self._pool.acquire()
             try:
+                await conn.execute("BEGIN TRANSACTION")
                 # 删除自引用关系（避免 FK 冲突）
                 await conn.execute(
                     "DELETE FROM relations WHERE subject = ? AND object = ?",
@@ -146,9 +148,13 @@ class Consolidator:
                     (to_entity, from_entity),
                 )
                 await conn.execute("DELETE FROM entities WHERE name = ?", (from_entity,))
-                await conn.commit()
+                await conn.execute("COMMIT")
             except Exception as e:
                 logger.warning("持久化关系重定向失败: %s", e)
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception:
+                    pass
                 return  # DB 失败则不更新内存，保持一致性
             finally:
                 await self._pool.release(conn)
@@ -336,9 +342,9 @@ class Consolidator:
     def _name_similarity(self, a: str, b: str) -> float:
         """计算两个实体名称的相似度。
 
-        基于 Jaccard 字符集相似度：交集字符数 / 并集字符数。
-        相比"字符出现比例"，Jaccard 是有效的相似度度量，
-        "云南" vs "南云" 不再等于 1.0。
+        基于 bigram (2-gram) Jaccard 相似度，保留字符顺序信息。
+        例如 "云南" vs "南云" = 0.0（bigram 完全不同），
+        而 "北京" vs "北京市" ≈ 0.5。
 
         Args:
             a: 实体名称 A
@@ -351,8 +357,12 @@ class Consolidator:
             return 0.0
         if a == b:
             return 1.0
-        set_a = set(a)
-        set_b = set(b)
+        # Bug fix: 使用 bigram 代替 char-set Jaccard，保留字序信息。
+        # 原 char-set Jaccard 对 "云南" vs "南云" 错误地给出 1.0。
+        def _bigrams(s: str):
+            return {s[i:i+2] for i in range(len(s) - 1)} or {s}  # 单字 fallback
+        set_a = _bigrams(a)
+        set_b = _bigrams(b)
         intersection = set_a & set_b
         union = set_a | set_b
         return len(intersection) / len(union) if union else 0.0

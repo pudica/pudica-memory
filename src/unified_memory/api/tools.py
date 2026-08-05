@@ -153,8 +153,9 @@ class ToolRegistry:
     async def _mempalace_search(self, query: str, top_k: int = 10) -> dict:
         """mempalace 兼容的语义搜索。"""
         loop = asyncio.get_running_loop()
+        from unified_memory.store.chroma_store import get_chroma_executor
         results = await loop.run_in_executor(
-            None, lambda: self._chroma.search(query, n_results=top_k),
+            get_chroma_executor(), lambda: self._chroma.search(query, n_results=top_k),
         )
         return {
             "results": [

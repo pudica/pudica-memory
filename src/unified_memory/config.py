@@ -168,13 +168,26 @@ class Config:
 
     def _resolve_paths(self) -> None:
         """解析所有路径，确保 Windows 兼容。"""
-        os.makedirs(self.data_dir, exist_ok=True)
+        try:
+            os.makedirs(self.data_dir, exist_ok=True)
+        except PermissionError as e:
+            raise RuntimeError(
+                f"无法创建数据目录 {self.data_dir}，请检查权限或设置 UNIFIED_MEMORY_DATA_DIR 环境变量。"
+            ) from e
         if not self.sqlite.db_path:
             self.sqlite.db_path = os.path.join(self.data_dir, "unified_memory.db")
-        os.makedirs(os.path.dirname(self.sqlite.db_path), exist_ok=True)
+        db_dir = os.path.dirname(self.sqlite.db_path)
+        if db_dir:
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except PermissionError as e:
+                raise RuntimeError(f"无法创建 SQLite 目录 {db_dir}，请检查权限。") from e
         if not self.chroma.persist_dir:
             self.chroma.persist_dir = os.path.join(self.data_dir, "chroma")
-        os.makedirs(self.chroma.persist_dir, exist_ok=True)
+        try:
+            os.makedirs(self.chroma.persist_dir, exist_ok=True)
+        except PermissionError as e:
+            raise RuntimeError(f"无法创建 ChromaDB 目录 {self.chroma.persist_dir}，请检查权限。") from e
 
     # ------------------------------------------------------------------
     # 配置加载/保存

@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 import os
 import chromadb
+import concurrent.futures
 from chromadb import PersistentClient
 from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
@@ -23,6 +24,9 @@ from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 _EF_CACHE: dict[str, Any] = {}
 _EF_CACHE_LOCK = threading.Lock()
 _EF_DIMENSION = 512  # BAAI/bge-small-zh-v1.5 输出维度
+# Bug fix: ChromaDB 专用线程池，避免与默认 ThreadPoolExecutor 竞争导致死锁
+_CHROMA_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+_CHROMA_EXECUTOR_LOCK = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +114,7 @@ def get_embedder() -> Any:
 
             onnx_ef = get_bge_onnx_embedding_function()
             if onnx_ef is not None:
-                _EF_DIMENSION = 512
+                _EF_DIMENSION = 512  # Bug fix: 现在在 _EF_CACHE_LOCK 保护内写入
                 _EF_CACHE[cache_key] = onnx_ef
                 return onnx_ef
         except Exception as e:  # noqa: BLE001
@@ -161,11 +165,48 @@ def get_embedder() -> Any:
 # ChromaDB Store
 # ---------------------------------------------------------------------------
 
+def shutdown_chroma_executor() -> None:
+    """关闭 ChromaDB 专用线程池（Bug fix: 防止 ResourceWarning）。
+
+    在应用 shutdown 时调用，显式关闭线程池。
+    """
+    global _CHROMA_EXECUTOR
+    if _CHROMA_EXECUTOR is not None:
+        try:
+            _CHROMA_EXECUTOR.shutdown(wait=False)
+        except Exception:
+            pass
+        finally:
+            _CHROMA_EXECUTOR = None
+
+
+def get_chroma_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """获取 ChromaDB 专用线程池（Bug fix: 避免与 asyncio 默认线程池竞争）。
+
+    ChromaDB 的同步操作在 run_in_executor 中执行，
+    使用专用线程池防止所有线程被 ChromaDB I/O 占用后
+    管线中其他 run_in_executor 调用全部阻塞。
+    """
+    global _CHROMA_EXECUTOR
+    if _CHROMA_EXECUTOR is not None:
+        return _CHROMA_EXECUTOR
+    with _CHROMA_EXECUTOR_LOCK:
+        if _CHROMA_EXECUTOR is None:
+            _CHROMA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="chroma_worker",
+            )
+        return _CHROMA_EXECUTOR
+
+
 class ChromaStore:
     """优化版 ChromaDB 存储后端。
 
     支持 HNSW 自适应参数、批量写入、嵌入器缓存、元数据索引。
     """
+
+    # Bug fix: _seen_hashes 上限，防止长期运行进程无限增长导致内存泄漏。
+    # 50K 覆盖绝大多数使用场景（restart 后从空开始，持续运行数月也很难突破此值）。
+    _MAX_SEEN_HASHES: int = 50000
 
     def __init__(self, persist_dir: str, collection_name: str = "memories"):
         """
@@ -178,9 +219,11 @@ class ChromaStore:
         self._client: Optional[PersistentClient] = None
         self._collection: Any = None
         self._embedder = get_embedder()
-        # 写入去重缓存（内容 hash → bool）
+        # 写入去重缓存（内容 hash → bool，有上限防泄漏）
         self._seen_hashes: set[str] = set()
         self._batch_lock = threading.Lock()
+        # Bug fix: 保护 _ensure_collection 的线程安全，防止多线程同时创建 collection
+        self._collection_lock = threading.Lock()
 
     def _ensure_client(self) -> None:
         """确保 PersistentClient 已创建。"""
@@ -213,33 +256,59 @@ class ChromaStore:
         return max(0.0, 1.0 - distance)
 
     def _ensure_collection(self, create: bool = True) -> None:
-        """确保 collection 已存在。"""
+        """确保 collection 已存在（线程安全）。
+
+        Bug fix: 添加 _collection_lock 防止多线程同时创建/获取 collection
+        导致 ChromaDB 内部状态不一致或重复创建错误。
+        """
         self._ensure_client()
         if self._collection is not None:
             return
-        try:
-            self._collection = self._client.get_collection(
-                self._collection_name,
-                embedding_function=self._embedder,
-            )
-            logger.info("ChromaDB 集合已加载: %s", self._collection_name)
-        except (ValueError, chromadb.errors.NotFoundError):
-            if not create:
-                raise
-            params = _hnsw_params(0)
-            self._collection = self._client.create_collection(
-                self._collection_name,
-                metadata=params,
-                embedding_function=self._embedder,
-            )
-            logger.info(
-                "ChromaDB 集合已创建: %s (HNSW params: %s)",
-                self._collection_name, params,
-            )
+        with self._collection_lock:
+            # 双重检查：锁内再确认一次
+            if self._collection is not None:
+                return
+            try:
+                self._collection = self._client.get_collection(
+                    self._collection_name,
+                    embedding_function=self._embedder,
+                )
+                logger.info("ChromaDB 集合已加载: %s", self._collection_name)
+            except (ValueError, chromadb.errors.NotFoundError):
+                if not create:
+                    raise
+                params = _hnsw_params(0)
+                self._collection = self._client.create_collection(
+                    self._collection_name,
+                    metadata=params,
+                    embedding_function=self._embedder,
+                )
+                logger.info(
+                    "ChromaDB 集合已创建: %s (HNSW params: %s)",
+                    self._collection_name, params,
+                )
 
     # ------------------------------------------------------------------
     # 写入操作
     # ------------------------------------------------------------------
+
+    def _trim_seen_hashes_if_needed(self) -> None:
+        """防止 _seen_hashes 无限增长（Bug fix: 长期运行进程内存泄漏）。
+
+        超过阈值时清除一半条目，后续写入重新建立去重缓存。
+        使用 set-pop 采样（无顺序保证，但哈希值均匀分布）。
+        """
+        if len(self._seen_hashes) >= self._MAX_SEEN_HASHES:
+            trim_count = len(self._seen_hashes) // 2
+            for _ in range(trim_count):
+                try:
+                    self._seen_hashes.pop()
+                except KeyError:
+                    break
+            logger.debug(
+                "_seen_hashes 清理 %d 条（当前 %d）",
+                trim_count, len(self._seen_hashes),
+            )
 
     def add_drawer(
         self,
@@ -264,6 +333,7 @@ class ChromaStore:
         content_hash = hashlib.sha256(content.encode()).hexdigest()
         if content_hash in self._seen_hashes:
             return content_hash
+        self._trim_seen_hashes_if_needed()
         self._seen_hashes.add(content_hash)
 
         doc_id = f"{wing}/{room}/{content_hash[:16]}"
@@ -306,6 +376,7 @@ class ChromaStore:
             content_hash = hashlib.sha256(content.encode()).hexdigest()
             if content_hash in self._seen_hashes:
                 continue
+            self._trim_seen_hashes_if_needed()
             self._seen_hashes.add(content_hash)
 
             wing = item.get("wing", "default")
@@ -339,6 +410,18 @@ class ChromaStore:
         """
         self._ensure_collection()
         self._collection.delete(ids=[doc_id])
+
+    def delete_batch(self, doc_ids: list[str]) -> None:
+        """批量删除多条记录（Bug fix: 新增方法，避免压缩任务回退到逐条删除）。
+
+        Args:
+            doc_ids: 文档 ID 列表
+        """
+        if not doc_ids:
+            return
+        self._ensure_collection()
+        self._collection.delete(ids=doc_ids)
+        logger.debug("批量删除 %d 条 ChromaDB 记录", len(doc_ids))
 
     # ------------------------------------------------------------------
     # 搜索操作

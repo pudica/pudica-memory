@@ -117,17 +117,36 @@ class SQLitePool:
                 await conn.execute("DROP TABLE IF EXISTS memories_fts")
         except Exception:
             pass  # 表不存在时 PRAGMA 返回空，正常
-        await conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-                id UNINDEXED,
-                content,
-                wing,
-                room,
-                content='memories',
-                content_rowid='rowid',
-                tokenize='trigram'
+        # Bug fix: trigram tokenizer may be unavailable on some Python/SQLite builds
+        # (e.g. default Windows Python). Fall back to unicode61 if trigram fails.
+        try:
+            await conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    id UNINDEXED,
+                    content,
+                    wing,
+                    room,
+                    content='memories',
+                    content_rowid='rowid',
+                    tokenize='trigram'
+                )
+            """)
+        except Exception:
+            logger.warning(
+                "FTS5 trigram tokenizer 不可用（可能是 SQLite 未编译 trigram），"
+                "回退到 unicode61 分词器。中文检索效果会下降。"
             )
-        """)
+            await conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    id UNINDEXED,
+                    content,
+                    wing,
+                    room,
+                    content='memories',
+                    content_rowid='rowid',
+                    tokenize='unicode61'
+                )
+            """)
         # 实体表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (
@@ -249,8 +268,13 @@ class SQLitePool:
                 VALUES (new.rowid, new.id, new.content, new.wing, new.room);
             END
         """)
-        # 重建 FTS 索引：用官方 rebuild 命令从 content 表回灌（幂等、兼容外部内容表）
-        await conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+        # Bug fix: 仅在 FTS 表为空时才重建索引，避免每次 init 都全量 rebuild。
+        # 外部内容表在初始化后由触发器自动同步，无需重复 rebuild。
+        # Bug fix: 用 LIMIT 1 替代 COUNT(*) 做存在性检查，避免大表全表扫描。
+        cursor = await conn.execute("SELECT 1 FROM memories_fts LIMIT 1")
+        fts_empty = (await cursor.fetchone()) is None
+        if fts_empty:
+            await conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
         await conn.commit()
 
     async def acquire(self) -> aiosqlite.Connection:
@@ -436,12 +460,18 @@ class WriteBuffer:
                 sql = f"INSERT OR REPLACE INTO {op.table} ({cols}) VALUES ({placeholders})"
                 await conn.execute(sql, list(op.data.values()))
             await conn.commit()
-            # 所有操作成功后才清除内存缓冲
+            # 所有操作成功后才清除内存缓冲（Bug fix: 仅清除本次刷盘的条目，
+            # 保留刷盘期间新加入的条目，防止竞态导致内存双写保护失效）
             for op in ops:
                 if not op.future.done():
                     op.future.set_result(True)
             logger.debug("Flushed %d writes to SQLite", len(ops))
-            self._mem_buffer.clear()
+            # 仅移除已刷盘的 ops，保留刷盘期间被 write() 新增的条目
+            flushed_count = len(ops)
+            if len(self._mem_buffer) > flushed_count:
+                self._mem_buffer[:] = self._mem_buffer[flushed_count:]
+            else:
+                self._mem_buffer.clear()
             return len(ops)
         except Exception as e:
             await conn.rollback()

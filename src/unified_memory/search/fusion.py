@@ -44,7 +44,10 @@ class RRFusion:
             "temporal": 0.6,
         }
 
-    def fuse(self, results: dict, top_k: int = 20) -> list[FusionResult]:
+    def fuse(
+        self, results: dict, top_k: int = 20,
+        weights: Optional[dict[str, float]] = None,
+    ) -> list[FusionResult]:
         """RRF 融合 + 分数归一化。
 
         k=30（小数据集区分度更好），结果 top_k 截断 + 分数归一化到 [0,1]。
@@ -52,10 +55,12 @@ class RRFusion:
         Args:
             results: {策略名: [ScoredResult, ...]} 字典
             top_k: 返回条数，默认 20
+            weights: 可选权重覆盖（Bug fix: 用于自适应权重，不修改共享状态避免并发问题）
 
         Returns:
             融合后按 RRF 得分降序排列的 FusionResult 列表
         """
+        effective_weights = weights if weights is not None else self._weights
         accumulator: dict[str, dict] = defaultdict(lambda: {
             "score": 0.0,
             "texts": [],
@@ -64,7 +69,7 @@ class RRFusion:
         })
 
         for strategy, scored_list in results.items():
-            weight = self._weights.get(strategy, 1.0)
+            weight = effective_weights.get(strategy, 1.0)
             for sr in scored_list:
                 doc_id = sr.id
                 rank = sr.rank + 1  # 1-indexed
@@ -215,20 +220,29 @@ class QueryClassifier:
         english_words = len([w for w in query.split() if w.strip()])
         effective_len = chinese_len + english_words
 
-        # 3. 检测实体查询：短文本 + 专有名词模式
+        # 3. 检测关键词查询：短文本 + 无疑问词 + 无完整句式
+        # Bug fix: 先检测关键词再检测实体。原来短文本（≤8字符）一律判为 entity，
+        # 导致 "Python教程"、"内存管理" 等关键词查询被错误路由到 graph 路。
+        has_question = any(p.search(query) for p in self._compiled_question)
+
+        # Bug fix: 对 9..15 字符区间的查询也检查实体模式，避免 "张三教授"、
+        # "Dr. Smith" 等中短实体名被误判为 keyword。
+        if 9 <= effective_len <= 15 and not has_question:
+            for pattern in self._compiled_entity:
+                if pattern.search(query):
+                    return "entity"
+
+        if effective_len <= 15 and not has_question:
+            return "keyword"
+
+        # 4. 检测实体查询：短文本 + 专有名词模式
         if effective_len <= 8:
             for pattern in self._compiled_entity:
                 if pattern.search(query):
                     return "entity"
-            # 短文本且无疑问词 → 可能是实体名
-            has_question = any(p.search(query) for p in self._compiled_question)
+            # 其他短文本默认为关键词
             if not has_question:
-                return "entity"
-
-        # 4. 检测关键词查询：短文本 + 无疑问词 + 无完整句式
-        has_question = any(p.search(query) for p in self._compiled_question)
-        if effective_len <= 15 and not has_question:
-            return "keyword"
+                return "keyword"
 
         # 5. 默认：语义查询
         return "semantic"
@@ -356,12 +370,10 @@ class TEMPREngine:
         if not results:
             return []
 
-        # 自适应权重调整
-        original_weights = None
+        # 自适应权重调整（Bug fix: 通过 fuse() 参数传递权重，不修改共享 self._fusion._weights）
+        adaptive_weights = None
         if self._adaptive and self._classifier and fusion_mode == "rrf":
-            original_weights = dict(self._fusion._weights)
             adaptive_weights = self._classifier.get_adaptive_weights(query)
-            self._fusion._weights = adaptive_weights
 
             cls_info = self._classifier.get_classification_info(query)
             import logging
@@ -372,14 +384,9 @@ class TEMPREngine:
             )
 
         # 融合
-        try:
-            if fusion_mode == "interleave":
-                result = self._fusion.interleave(results, top_k=top_k)
-            else:
-                result = self._fusion.fuse(results, top_k=top_k)
-        finally:
-            # 恢复原始权重
-            if original_weights is not None:
-                self._fusion._weights = original_weights
+        if fusion_mode == "interleave":
+            result = self._fusion.interleave(results, top_k=top_k)
+        else:
+            result = self._fusion.fuse(results, top_k=top_k, weights=adaptive_weights)
 
         return result

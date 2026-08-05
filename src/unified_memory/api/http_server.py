@@ -98,7 +98,7 @@ class HTTPServer:
             """健康检查。"""
             handler = self._get_handler("system_health")
             if handler is None:
-                return {"status": "error", "message": "tool not registered"}
+                raise HTTPException(status_code=500, detail="system_health not registered")
             return await handler()
 
         @app.post("/api/v1/search")

@@ -491,15 +491,17 @@ class Compressor:
             return
         try:
             loop = asyncio.get_running_loop()
+            from unified_memory.store.chroma_store import get_chroma_executor
             await loop.run_in_executor(
-                None, lambda: self._chroma.delete_batch(all_ids)
+                get_chroma_executor(), lambda: self._chroma.delete_batch(all_ids),
             )
         except AttributeError:
-            # ChromaStore 可能没有 delete_batch 方法
+            # ChromaStore 可能没有 delete_batch 方法（v3.2 已修复）
+            from unified_memory.store.chroma_store import get_chroma_executor
             for mid in all_ids:
                 try:
                     await loop.run_in_executor(
-                        None, lambda m=mid: self._chroma._collection.delete(ids=[m])
+                        get_chroma_executor(), lambda m=mid: self._chroma._collection.delete(ids=[m]),
                     )
                 except Exception as e:
                     logger.warning("清理向量失败 %s: %s", mid, e)

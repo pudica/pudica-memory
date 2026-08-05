@@ -43,8 +43,10 @@ class SemanticRetriever:
             ScoredResult 列表，按得分降序排列
         """
         loop = asyncio.get_running_loop()
+        from unified_memory.store.chroma_store import get_chroma_executor
         results = await loop.run_in_executor(
-            None, lambda: self._chroma.search(query, n_results=top_k, wing=wing, room=room),
+            get_chroma_executor(),
+            lambda: self._chroma.search(query, n_results=top_k, wing=wing, room=room),
         )
         scored: list[ScoredResult] = []
         for i, r in enumerate(results):

@@ -19,6 +19,9 @@ class L0Dedup:
     参考 TencentDB state-manager.ts 的 processedToolCallIds 模式。
     """
 
+    # Bug fix: processed_ids 上限，防止长期运行进程无限增长导致内存泄漏
+    _MAX_PROCESSED_IDS: int = 20000
+
     def __init__(self, maxsize: int = 1000):
         """
         Args:
@@ -55,6 +58,14 @@ class L0Dedup:
         fingerprint = hashlib.sha256(content.encode()).hexdigest()
         self.cache[fingerprint] = content
         if content_id:
+            # Bug fix: 防止 processed_ids 无限增长——超过阈值时清理一半
+            if len(self.processed_ids) >= self._MAX_PROCESSED_IDS:
+                trim = len(self.processed_ids) // 2
+                for _ in range(trim):
+                    try:
+                        self.processed_ids.pop()
+                    except KeyError:
+                        break
             self.processed_ids.add(content_id)
         if len(self.cache) > self.maxsize:
             self.cache.popitem(last=False)
