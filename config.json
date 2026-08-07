@@ -1,8 +1,8 @@
 {
   "llm": {
-    "api_base": "http://localhost:11434/v1",
-    "api_key": "ollama",
-    "model": "qwen2.5:7b",
+    "api_base": "https://ark.cn-beijing.volces.com/api/plan/v3",
+    "api_key": "__UNIFIED_MEMORY_API_KEY__",
+    "model": "deepseek-v4-flash-260425",
     "max_tokens": 4096,
     "temperature": 0.1,
     "timeout": 30.0
@@ -25,7 +25,39 @@
     "l1_idle_timeout": 60.0,
     "l2_null_threshold": 4,
     "l2_timeout": 300.0,
-    "l3_default_budget": 4000
+    "l3_default_budget": 4000,
+    "verbatim_enabled": true
+  },
+  "reranker": {
+    "enabled": true,
+    "strategy": "heuristic",
+    "top_n": 20,
+    "final_k": 10,
+    "max_concurrent": 4
+  },
+  "mental_model": {
+    "enabled": true,
+    "belief_update_threshold": 0.6,
+    "max_beliefs": 100,
+    "belief_ttl": 0
+  },
+  "compression": {
+    "enabled": true,
+    "min_age_seconds": 604800,
+    "batch_size": 50,
+    "keep_ratio": 0.2,
+    "interval": 86400
+  },
+  "middleware": {
+    "enabled": true,
+    "auto_store": true,
+    "auto_search": true,
+    "auto_inject": true,
+    "min_message_length": 5,
+    "search_top_k": 10,
+    "max_context_items": 5,
+    "max_context_chars": 2000,
+    "store_llm_response": true
   },
   "tasks": {
     "reflect_cron": "0 2 * * *",

@@ -38,16 +38,42 @@ class L2SceneOrganizer:
             场景 ID，如果无法创建则返回 None
         """
         if not extracted or not extracted.get("summary"):
+            logger.warning("L2 organize 早退: summary=%r, entities=%s",
+                           extracted.get("summary") if isinstance(extracted, dict) else "NOTDICT",
+                           [e.get("name") if isinstance(e, dict) else e for e in extracted.get("entities", [])]
+                           if isinstance(extracted, dict) else "N/A")
             return None
+        logger.info("L2 organize 进入: summary_len=%d, entities=%s",
+                    len(extracted.get("summary", "")),
+                    [e.get("name") if isinstance(e, dict) else e for e in extracted.get("entities", [])])
 
         # 1. 更新知识图谱实体和关系
         # Bug fix: 添加 entity dict 格式验证，防止 LLM 提取的非标准格式
         # 导致 entity["name"] / entity["type"] 抛出 TypeError
+        valid_entities: list[str] = []
         for entity in extracted.get("entities", []):
             if not isinstance(entity, dict) or "name" not in entity:
                 logger.debug("跳过格式异常的实体: %s", entity)
                 continue
             await self._kg.add_entity(entity["name"], entity.get("type", "unknown"))
+            valid_entities.append(entity["name"])
+
+        # 关联图自动填充：同轮 ingest 提取到 >=2 个实体时，两两建共现关联边。
+        # 复用 add_relation_if_absent（幂等，重复共现叠加权重），同一轮的多实体
+        # 说明它们在同一上下文里共同出现，构成"关联图"的基础关系骨架。
+        logger.info("L2 关联图: valid_entities=%s, entities_from_extracted=%s",
+                     valid_entities,
+                     [e.get("name") if isinstance(e, dict) else e for e in extracted.get("entities", [])])
+        if len(valid_entities) >= 2:
+            for i in range(len(valid_entities)):
+                for j in range(i + 1, len(valid_entities)):
+                    await self._kg.add_relation_if_absent(
+                        valid_entities[i],
+                        "co_occurs_with",
+                        valid_entities[j],
+                        weight=1.0,
+                        source="auto_graph",
+                    )
 
         for rel in extracted.get("relations", []):
             if not isinstance(rel, dict):

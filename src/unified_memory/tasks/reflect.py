@@ -13,6 +13,15 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 # Reflect 提示词
+# 语言保持规则参考（Hindsight #3181）：当源记忆为中文时，洞察/描述/建议
+# 必须以中文输出。本 prompt 本身为中文，此规则作为防御性约束，防止 prompt
+# 未来被改写成英文时多语言模型将中文源事实翻译成英文观察。
+_LANGUAGE_RULE = """
+## 输出语言
+
+用源记忆的语言写出每个洞察、缺口、跨场景关联和心智模型更新的描述——永远不要翻译它们。当同一批源事实混用多种语言时，以多数派语言为准。专有名词、标识符、单位保持原样不译。
+"""
+
 REFLECT_PROMPT = """# 反思任务
 
 ## 上下文
@@ -25,6 +34,7 @@ REFLECT_PROMPT = """# 反思任务
 
 {mental_models}
 
+{language_rule}
 ## 任务
 根据以上信息，执行以下分析：
 
@@ -215,7 +225,7 @@ class Reflector:
         if not mental_models_text:
             mental_models_text = "（暂无已知心智模型）"
 
-        prompt = REFLECT_PROMPT.format(context=context, mental_models=mental_models_text)
+        prompt = REFLECT_PROMPT.format(context=context, mental_models=mental_models_text, language_rule=_LANGUAGE_RULE)
 
         for attempt in range(self._max_retries):
             try:

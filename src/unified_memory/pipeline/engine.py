@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
+from unified_memory.pipeline.encoding_repair import repair_document
 from unified_memory.pipeline.l0_dedup import L0Dedup
 from unified_memory.pipeline.l1_extractor import L1Extractor
 from unified_memory.pipeline.l2_scene import L2SceneOrganizer
@@ -139,6 +140,9 @@ class PipelineEngine:
         Returns:
             消息 ID，如果去重则返回空字符串
         """
+        # L0 预处理：Windows 编码修复（NUL 清理 + mojibake 修复）
+        content = repair_document(content)
+
         # L0：去重
         if self._dedup.is_duplicate(content):
             logger.debug("L0 去重: 内容已存在")

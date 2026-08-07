@@ -14,7 +14,7 @@ os.environ["PYTHONUTF8"] = "1"
 os.environ["UNIFIED_MEMORY_STORAGE_DIR"] = os.path.join(PROJECT_ROOT, "data")
 
 # 插入 --mcp 参数
-sys.argv = [sys.argv[0], "--mcp"]
+sys.argv = [sys.argv[0], "--mcp", "--auto"]
 
 from unified_memory.main import main
 

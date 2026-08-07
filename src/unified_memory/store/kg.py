@@ -330,6 +330,64 @@ class KnowledgeGraph:
                 await self._persist_relation(rel)
             return rel
 
+    async def add_relation_if_absent(
+        self,
+        subject: str,
+        predicate: str,
+        obj: str,
+        weight: float = 1.0,
+        source: str = "auto",
+    ) -> Relation:
+        """添加关系，若同 (subject, predicate, object) 已存在则不重复插入。
+
+        关联图自动填充用：同一 ingest 的多个实体两两建边，避免重复三元组膨胀。
+        已存在时权重累加（体现共现强度），返回已有关系对象。
+
+        Args:
+            subject: 主体实体名称
+            predicate: 关系谓词
+            obj: 客体实体名称
+            weight: 新增权重（已存在时累加）
+            source: 来源
+
+        Returns:
+            关系对象（新增或已存在的）
+        """
+        async with self._lock:
+            for rel in self._relations:
+                if (
+                    rel.subject == subject
+                    and rel.predicate == predicate
+                    and rel.object == obj
+                ):
+                    # 已存在：累加权重体现共现强度
+                    new_weight = rel.weight + weight
+                    rel.weight = new_weight
+                    if self._pool:
+                        await self._persist_relation(rel)
+                    return rel
+            # 不存在：调用底层插入（使用 _add_entity_unlocked 需锁，这里已持有锁）
+            if subject not in self._all_entity_names:
+                await self._add_entity_unlocked(subject, "unknown")
+            if obj not in self._all_entity_names:
+                await self._add_entity_unlocked(obj, "unknown")
+            rel = Relation(
+                id=str(uuid4()),
+                subject=subject,
+                predicate=predicate,
+                object=obj,
+                weight=weight,
+                source=source,
+                created_at=time.time(),
+            )
+            rel_idx = len(self._relations)
+            self._relations.append(rel)
+            self._relation_index.setdefault(subject, []).append(rel_idx)
+            self._relation_index.setdefault(obj, []).append(rel_idx)
+            if self._pool:
+                await self._persist_relation(rel)
+            return rel
+
     async def get_relations(
         self, subject: Optional[str] = None, predicate: Optional[str] = None
     ) -> list[Relation]:
