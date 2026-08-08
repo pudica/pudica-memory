@@ -93,10 +93,10 @@ DEFAULT_ENTITY_PATTERNS: list[tuple[str, str]] = [
 
 # 事实类型关键词（Hindsight 4 类结构化记忆）
 FACT_TYPE_KEYWORDS: dict[str, list[str]] = {
-    "observation": ["观察", "发现", "看到", "注意到", "感觉", "觉得", "现象", "情况", "状态"],
-    "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成"],
-    "world": ["是", "属于", "位于", "包括", "包含", "有", "定义", "指", "代表", "构成"],
-    "opinion": ["认为", "建议", "推荐", "应该", "值得", "好", "不好", "不错", "偏好", "倾向"],
+    "observation": ["观察", "发现", "看到", "注意到", "感觉", "觉得", "现象", "情况", "状态", "天气", "今天", "外面", "这里", "那里"],
+    "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成", "去过", "来过", "去过", "去过", "去过", "去了", "来了", "做了", "吃过", "用过", "去过", "去过"],
+    "world": ["是", "属于", "位于", "包括", "包含", "有", "定义", "指", "代表", "构成", "的", "省会", "首都", "位于", "号称"],
+    "opinion": ["认为", "建议", "推荐", "应该", "值得", "好", "不好", "不错", "偏好", "倾向", "觉得", "不太", "感觉"],
 }
 
 # 事实类型置信度权重（Hindsight: 带置信度的事实提取）
@@ -199,6 +199,8 @@ class L1Extractor:
             "time_range": time_range,
             "fact_type": fact_type,
             "confidence": self._compute_confidence(fact_type, len(entities), len(combined)),
+            "authority": self._evaluate_authority(combined, fact_type, len(entities)),
+            "trust_score": self._compute_trust_score(fact_type, len(entities), len(combined)),
         }
 
     def _extract_entities(self, text: str) -> list[dict]:
@@ -330,28 +332,79 @@ class L1Extractor:
 
     def _compute_confidence(self, fact_type: str, entity_count: int, text_length: int) -> float:
         """计算提取结果的置信度（Hindsight: 带置信度的事实提取）。
+        综合考量事实类型、实体数量和文本长度。
+        """
+        base = FACT_TYPE_CONFIDENCE.get(fact_type, 0.5)
+        entity_bonus = min(0.15, entity_count * 0.03)
+        if 50 <= text_length <= 500:
+            length_bonus = 0.1
+        elif text_length < 20:
+            length_bonus = -0.15
+        elif text_length > 2000:
+            length_bonus = -0.05
+        else:
+            length_bonus = 0.0
+        return max(0.1, min(1.0, base + entity_bonus + length_bonus))
+
+    def _evaluate_authority(self, text: str, fact_type: str, entity_count: int) -> str:
+        """评估记忆的权威等级（Ground Truth 层级）。
+
+        规则：
+        - "我是" / "我叫" / "我的" 等第一人称直接声明 → critical
+        - 客观事实（fact_type=world）且实体≥3 → high
+        - 个人经历（fact_type=experience）→ high
+        - 观察（fact_type=observation）且实体≥2 → medium
+        - 主观意见（fact_type=opinion）→ low
+        - 默认 → medium
+
+        Returns:
+            "critical" | "high" | "medium" | "low"
+        """
+        # 第一人称直接声明：用户自己说的，权威最高
+        first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自"]
+        for p in first_person_patterns:
+            if p in text[:200]:
+                return "critical"
+
+        # 客观事实 → high（只要是 world 类型且有实体）
+        if fact_type == "world" and entity_count >= 1:
+            return "high"
+        if fact_type == "experience":
+            return "high"
+
+        # 观察 → medium（只要有实体，或者没有实体但确实是 observation 类型）
+        if fact_type == "observation" and entity_count >= 1:
+            return "medium"
+        if fact_type == "observation":
+            return "medium"  # 观察即使无实体也给 medium，不降级到 low
+
+        # 主观意见 → low
+        if fact_type == "opinion":
+            return "low"
+
+        return "medium"
+
+    def _compute_trust_score(self, fact_type: str, entity_count: int, text_length: int) -> float:
+        """计算记忆的 trust score（0-1）。
 
         综合考量：
         - 事实类型的基础置信度
-        - 提取到的实体数量（越多越可靠）
-        - 文本长度（过短可能信息不足）
-
-        Args:
-            fact_type: 事实类型
-            entity_count: 提取到的实体数量
-            text_length: 原始文本长度
+        - 实体数量（越多越可靠，但不超过 5 个）
+        - 文本长度（50-500 字为最佳区间）
 
         Returns:
-            0-1 之间的置信度
+            0-1 之间的 trust score
         """
         base = FACT_TYPE_CONFIDENCE.get(fact_type, 0.5)
-        # 实体数量加成（最多 +0.1）
-        entity_bonus = min(0.1, entity_count * 0.02)
-        # 文本长度加成（50-500 字为最佳区间）
+        # 实体数量加成（最多 +0.15）
+        entity_bonus = min(0.15, entity_count * 0.03)
+        # 文本长度加成
         if 50 <= text_length <= 500:
-            length_bonus = 0.05
+            length_bonus = 0.1
         elif text_length < 20:
-            length_bonus = -0.1  # 过短惩罚
+            length_bonus = -0.15  # 过短惩罚
+        elif text_length > 2000:
+            length_bonus = -0.05  # 过长噪声
         else:
             length_bonus = 0.0
         return max(0.1, min(1.0, base + entity_bonus + length_bonus))

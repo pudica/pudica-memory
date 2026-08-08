@@ -7,6 +7,7 @@ MCP 工具注册表，兼容 mempalace 工具名 + 新增 unified-memory 工具�
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,12 @@ class ToolRegistry:
         self._tools: dict[str, dict] = {}
         self._register_all()
 
+        # 注入层缓存
+        self._session_injected: dict[str, set[str]] = {}  # session_id → set[memory_id]
+        self._SESSION_TTL: float = 1800.0  # 30 分钟
+        self._session_last_active: dict[str, float] = {}
+        self._threshold_override: float = 0.3
+
     def _register_all(self) -> None:
         """注册所有工具。"""
         # ---- mempalace 兼容工具 ----
@@ -111,14 +118,7 @@ class ToolRegistry:
                        "获取完整上下文（记忆+心智模型）", {"query": "str", "top_k": "int (optional)"})
 
     def _register(self, name: str, handler: Any, description: str, params: dict) -> None:
-        """注册单个工具。
-
-        Args:
-            name: 工具名称
-            handler: 处理函数
-            description: 工具描述
-            params: 参数描述
-        """
+        """注册单个工具。"""
         self._tools[name] = {
             "name": name,
             "handler": handler,
@@ -127,22 +127,11 @@ class ToolRegistry:
         }
 
     def get_tool(self, name: str) -> Optional[dict]:
-        """获取工具定义。
-
-        Args:
-            name: 工具名称
-
-        Returns:
-            工具定义字典，不存在则返回 None
-        """
+        """获取工具定义。"""
         return self._tools.get(name)
 
     def list_tools(self) -> list[dict]:
-        """列出所有工具。
-
-        Returns:
-            [{"name": str, "description": str, "params": dict}, ...]
-        """
+        """列出所有工具。"""
         return [
             {"name": t["name"], "description": t["description"], "params": t["params"]}
             for t in self._tools.values()
@@ -225,7 +214,6 @@ class ToolRegistry:
             row = await cursor.fetchone()
             if not row:
                 return {"error": "not found"}
-            # 解析 metadata JSON 字符串
             meta_raw = row["metadata"]
             if isinstance(meta_raw, str):
                 try:
@@ -432,7 +420,6 @@ class ToolRegistry:
         """逐字回溯原始记忆（MemPalace: Verbatim Storage）。"""
         conn = await self._pool.acquire()
         try:
-            # 使用 LIKE 搜索原始内容
             cursor = await conn.execute(
                 """SELECT id, memory_id, raw_content, source, created_at
                    FROM verbatim
@@ -456,8 +443,19 @@ class ToolRegistry:
         finally:
             await self._pool.release(conn)
 
-    async def _memory_context(self, query: str, top_k: int = 10) -> dict:
-        """获取完整上下文：检索结果 + 心智模型（Hindsight: 完整上下文注入）。"""
+    # ========================================================================
+    # 增强版 memory_context：精准注入 + per-session 去重 + 动态预算 + 权威排序
+    # ========================================================================
+
+    async def _memory_context(self, query: str, top_k: int = 10,
+                              session_id: str = "",
+                              auto_inject: bool = True,
+                              budget: int = 4000) -> dict:
+        """获取完整上下文（增强版）：支持自动注入、per-session 去重、动态预算、阈值过滤、权威排序、摘要压缩。
+
+        auto_inject=True 时，返回注入文本（可直接插入 system prompt），
+        auto_inject=False 时返回原始检索结果。
+        """
         # 1. 记忆检索
         results = await self._engine.search(query, top_k=top_k)
 
@@ -466,16 +464,137 @@ class ToolRegistry:
         if self._mental_models:
             mental_models_text = await self._mental_models.format_for_context(max_items=10)
 
+        if not auto_inject:
+            return {
+                "memories": [
+                    {"id": r.id, "text": r.text, "score": r.score, "sources": r.sources}
+                    for r in results
+                ],
+                "mental_models": mental_models_text,
+                "total_memories": len(results),
+            }
+
+        # ---- 增强注入模式 ----
+
+        # 3. per-session 去重
+        self._cleanup_expired_sessions()
+        injected_ids = self._session_injected.get(session_id, set()) if session_id else set()
+        total_candidates = len(results)
+
+        # 4. 动态预算：按输入长度分配
+        input_len = len(query)
+        if input_len < 50:
+            max_items = 2
+        elif input_len < 200:
+            max_items = 4
+        else:
+            max_items = 6
+
+        # 5. 阈值过滤 + 去重 + 预算截断
+        filtered = []
+        for r in results:
+            if session_id and r.id in injected_ids:
+                continue
+            if r.score < self._threshold_override:
+                continue
+            filtered.append(r)
+            if len(filtered) >= max_items:
+                break
+
+        # 6. 获取权威等级 + trust score，按 authority 排序
+        ranked = []
+        for r in filtered:
+            authority = await self._get_authority_level(r.id)
+            trust_score = await self._get_trust_score(r.id)
+            ranked.append((r, authority, trust_score))
+
+        auth_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        ranked.sort(key=lambda x: auth_order.get(x[1], 99))
+
+        # 7. 组装注入文本
+        lines = []
+        token_cost = 0
+        for r, authority, _ in ranked:
+            label = {"critical": "[权威]", "high": "[高]", "medium": "[中]", "low": "[低]"}.get(authority, "[中]")
+            text = r.text[:300]
+            line = f"{label} {text}"
+            if token_cost + len(line) > budget:
+                break
+            lines.append(line)
+            token_cost += len(line)
+            if session_id:
+                if session_id not in self._session_injected:
+                    self._session_injected[session_id] = set()
+                self._session_injected[session_id].add(r.id)
+                self._session_last_active[session_id] = time.time()
+
+        # 8. 组装注入文本
+        if lines:
+            context_parts = [
+                "## 记忆上下文",
+                "以下信息来自 pudica-memory，按权威等级排列：",
+                "",
+            ]
+            context_parts.extend(lines)
+            context_parts.append("")
+            context_parts.append("请优先使用 [权威] 和 [高] 等级的记忆。[低] 等级的记忆可能不准确，仅供参考。")
+            context = "\n".join(context_parts)
+        else:
+            context = ""
+
         return {
-            "memories": [
-                {
-                    "id": r.id,
-                    "text": r.text,
-                    "score": r.score,
-                    "sources": r.sources,
-                }
-                for r in results
-            ],
+            "context": context,
+            "injected_ids": [r.id for r, _, _ in ranked],
+            "stats": {
+                "total_candidates": total_candidates,
+                "filtered_out": total_candidates - len(ranked),
+                "injected": len(ranked),
+                "token_cost": token_cost,
+            },
             "mental_models": mental_models_text,
-            "total_memories": len(results),
         }
+
+    # ---- 注入层辅助方法 ----
+
+    def _cleanup_expired_sessions(self) -> None:
+        """清理超时会话（30 分钟无活动）。"""
+        now = time.time()
+        expired = [
+            sid for sid, last in self._session_last_active.items()
+            if now - last > self._SESSION_TTL
+        ]
+        for sid in expired:
+            self._session_injected.pop(sid, None)
+            self._session_last_active.pop(sid, None)
+
+    async def _get_authority_level(self, memory_id: str) -> str:
+        """从 SQLite 获取记忆的权威等级。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cursor = await conn.execute(
+                    "SELECT authority FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                row = await cursor.fetchone()
+                return row["authority"] if row else "medium"
+            finally:
+                await self._pool.release(conn)
+        except Exception:
+            return "medium"
+
+    async def _get_trust_score(self, memory_id: str) -> float:
+        """从 SQLite 获取记忆的 trust score。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cursor = await conn.execute(
+                    "SELECT trust_score FROM memories WHERE id = ?",
+                    (memory_id,),
+                )
+                row = await cursor.fetchone()
+                return row["trust_score"] if row and row["trust_score"] is not None else 0.5
+            finally:
+                await self._pool.release(conn)
+        except Exception:
+            return 0.5

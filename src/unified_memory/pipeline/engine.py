@@ -282,8 +282,8 @@ class PipelineEngine:
                     conn = await self._pool.acquire()
                     try:
                         await conn.execute(
-                            "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, meta_json, msg["timestamp"], msg["timestamp"]),
+                                                    "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, authority, trust_score, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                                    (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, extracted.get("authority", "medium"), extracted.get("trust_score", 0.5), meta_json, msg["timestamp"], msg["timestamp"]),
                         )
                         await conn.commit()
                         sqlite_ok_ids.add(msg["id"])

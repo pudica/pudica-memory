@@ -96,6 +96,9 @@ class SQLitePool:
                 fact_type TEXT DEFAULT 'observation',
                 proof_count INTEGER DEFAULT 1,
                 source_memory_ids TEXT DEFAULT '[]',
+                authority TEXT DEFAULT 'medium',
+                trust_score REAL DEFAULT 0.5,
+                summary TEXT DEFAULT '',
                 metadata TEXT DEFAULT '{}',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
