@@ -92,11 +92,14 @@ DEFAULT_ENTITY_PATTERNS: list[tuple[str, str]] = [
 ]
 
 # 事实类型关键词（Hindsight 4 类结构化记忆）
+# Bug fix (BUG-10): 清理重复项。
+# Bug fix (BUG-7): world 关键词移除极常见的"是/的/有/构成"等虚词，
+#   避免任何带"的"的句子误判为 world。world 仅保留明确的客观事实动词。
 FACT_TYPE_KEYWORDS: dict[str, list[str]] = {
     "observation": ["观察", "发现", "看到", "注意到", "感觉", "觉得", "现象", "情况", "状态", "天气", "今天", "外面", "这里", "那里"],
-    "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成", "去过", "来过", "去过", "去过", "去过", "去了", "来了", "做了", "吃过", "用过", "去过", "去过"],
-    "world": ["是", "属于", "位于", "包括", "包含", "有", "定义", "指", "代表", "构成", "的", "省会", "首都", "位于", "号称"],
-    "opinion": ["认为", "建议", "推荐", "应该", "值得", "好", "不好", "不错", "偏好", "倾向", "觉得", "不太", "感觉"],
+    "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成", "去过", "来过", "去了", "来了", "做了", "吃过"],
+    "world": ["属于", "位于", "包括", "包含", "定义", "指", "代表", "省会", "首都", "号称", "是来自", "名称为", "由构成"],
+    "opinion": ["认为", "建议", "推荐", "应该", "值得", "偏好", "倾向", "不太"],
 }
 
 # 事实类型置信度权重（Hindsight: 带置信度的事实提取）
@@ -156,6 +159,17 @@ class L1Extractor:
                 result.setdefault("time_range", {})
                 result.setdefault("fact_type", "observation")
                 result.setdefault("confidence", 0.7)
+                # Bug fix (BUG-8): LLM 路径原先不产生 authority/trust_score，
+                # 导致 engine.py 的 INSERT 用 .get() 兜底，全落 medium/0.5。
+                # 这里用本地规则为 LLM 结果补充权威等级和信任分。
+                authority = self._evaluate_authority("\n".join(messages), result["fact_type"], len(result.get("entities", [])))
+                trust_score = self._compute_trust_score(
+                    result["fact_type"],
+                    len(result.get("entities", [])),
+                    len("\n".join(messages)),
+                )
+                result.setdefault("authority", authority)
+                result.setdefault("trust_score", trust_score)
                 return result
             except Exception as e:
                 last_error = e
@@ -198,7 +212,9 @@ class L1Extractor:
             "summary": summary,
             "time_range": time_range,
             "fact_type": fact_type,
-            "confidence": self._compute_confidence(fact_type, len(entities), len(combined)),
+            # Bug fix (BUG-5): confidence 与 trust_score 计算逻辑完全相同，
+            # 且 confidence 无对应数据库列，白算不落库。统一收敛到 trust_score，
+            # 避免冗余平行字段。上游 engine.py INSERT 只写 authority/trust_score。
             "authority": self._evaluate_authority(combined, fact_type, len(entities)),
             "trust_score": self._compute_trust_score(fact_type, len(entities), len(combined)),
         }
@@ -260,6 +276,14 @@ class L1Extractor:
     _SUFFIX_WORDS: tuple[str, ...] = tuple(
         sorted({s for v in _TYPE_SUFFIXES.values() for s in v}, key=len, reverse=True)
     )
+    # Bug fix (BUG-9): product 类型下这些词+产品后缀是合法真实产品名
+    # （如"管理系统"、"评估平台"），不能被当作噪声前缀剥掉。
+    # 原实现无限循环剥前缀 → "管理系统"被剥成"系统"，丢失真实实体名。
+    _PRODUCT_SAFE_PREFIXES = frozenset({
+        "评估", "测试", "管理", "开发", "服务", "支持", "使用", "研究",
+        "建设", "运营", "提供", "实现", "打造", "学习", "分析", "监控",
+        "预测", "营销", "客户", "智能", "数字",
+    })
 
     def _clean_entity_name(self, name: str, ent_type: str = "org") -> str:
         """剥离常见非实体前缀 + 按实体类型后缀词裁剪，保留紧凑实体名。"""
@@ -268,9 +292,16 @@ class L1Extractor:
         if ent_type == "person" and name in ("方案", "系统", "平台", "模型", "框架", "引擎", "管线", "器具", "工具"):
             return ""
         changed = True
-        while changed and len(name) > 2:
+        # 防死循环：最多剥 6 轮（Bug fix BUG-9）
+        guard = 0
+        while changed and len(name) > 2 and guard < 6:
+            guard += 1
             changed = False
             for p in self._NOISE_PREFIXES:
+                # Bug fix (BUG-9): product 类型跳过"产品安全前缀"（如"管理"），
+                # 否则"管理系统" → "系统"。其余类型继续剥。
+                if p in self._PRODUCT_SAFE_PREFIXES and ent_type == "product":
+                    continue
                 if name.startswith(p) and len(name) > len(p) + 1:
                     name = name[len(p):]
                     changed = True
@@ -330,55 +361,48 @@ class L1Extractor:
             return truncated[:last_punct + 1]
         return truncated
 
-    def _compute_confidence(self, fact_type: str, entity_count: int, text_length: int) -> float:
-        """计算提取结果的置信度（Hindsight: 带置信度的事实提取）。
-        综合考量事实类型、实体数量和文本长度。
-        """
-        base = FACT_TYPE_CONFIDENCE.get(fact_type, 0.5)
-        entity_bonus = min(0.15, entity_count * 0.03)
-        if 50 <= text_length <= 500:
-            length_bonus = 0.1
-        elif text_length < 20:
-            length_bonus = -0.15
-        elif text_length > 2000:
-            length_bonus = -0.05
-        else:
-            length_bonus = 0.0
-        return max(0.1, min(1.0, base + entity_bonus + length_bonus))
-
     def _evaluate_authority(self, text: str, fact_type: str, entity_count: int) -> str:
         """评估记忆的权威等级（Ground Truth 层级）。
 
-        规则：
-        - "我是" / "我叫" / "我的" 等第一人称直接声明 → critical
-        - 客观事实（fact_type=world）且实体≥3 → high
-        - 个人经历（fact_type=experience）→ high
-        - 观察（fact_type=observation）且实体≥2 → medium
-        - 主观意见（fact_type=opinion）→ low
+        规则（Bug fix BUG-1/2: 提升区分度，摆脱对 fact_type 的过度依赖）：
+        - 第一人称直接声明（我是/我叫/我的/我喜欢等）→ critical
+        - 明确的个人经历动词（我做过/我用过/我吃过等）→ critical
+        - 客观事实（world）或高实体数的具体陈述（实体≥3）→ high
+        - 有实体的观察/经历（实体≥1）→ medium
+        - 观察、或一般性陈述（observation）→ medium
+        - 主观意见（opinion）、无实体的空泛观察 → low
         - 默认 → medium
 
         Returns:
             "critical" | "high" | "medium" | "low"
         """
         # 第一人称直接声明：用户自己说的，权威最高
-        first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自"]
+        first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自", "我喜欢", "我住", "我在"]
         for p in first_person_patterns:
             if p in text[:200]:
                 return "critical"
 
-        # 客观事实 → high（只要是 world 类型且有实体）
+        # 明确的个人经历动词 → critical（用户亲历可作第一手凭证）
+        experience_verbs = ["我做过", "我用过", "我吃过", "我去过", "我试过", "我用了", "我做了", "我完成了"]
+        for v in experience_verbs:
+            if v in text[:300]:
+                return "critical"
+
+        # 客观事实（world）或具体实体陈述（≥3 个实体）→ high
         if fact_type == "world" and entity_count >= 1:
+            return "high"
+        if entity_count >= 3:
             return "high"
         if fact_type == "experience":
             return "high"
 
-        # 观察 → medium（只要有实体，或者没有实体但确实是 observation 类型）
-        if fact_type == "observation" and entity_count >= 1:
+        # 有实体的观察/普通陈述 → medium
+        if entity_count >= 1:
             return "medium"
         if fact_type == "observation":
-            return "medium"  # 观察即使无实体也给 medium，不降级到 low
+            return "medium"
 
-        # 主观意见 → low
+        # 主观意见、或完全无实体的空泛内容 → low
         if fact_type == "opinion":
             return "low"
 
@@ -391,6 +415,10 @@ class L1Extractor:
         - 事实类型的基础置信度
         - 实体数量（越多越可靠，但不超过 5 个）
         - 文本长度（50-500 字为最佳区间）
+
+        Bug fix (BUG-2): 恢复区分度。原先因 world 关键词误判导致大量文本
+        落 world(0.9)，trust 全被拉高到接近 0.9；现在 world 关键词收紧后
+        分布自然回落。仍按类型*实体*长度加权。
 
         Returns:
             0-1 之间的 trust score
@@ -407,7 +435,8 @@ class L1Extractor:
             length_bonus = -0.05  # 过长噪声
         else:
             length_bonus = 0.0
-        return max(0.1, min(1.0, base + entity_bonus + length_bonus))
+        # 落到 2 位小数，便于区分（Bug fix: 避免出现 0.8099999 这类浮点尾差）
+        return round(max(0.1, min(1.0, base + entity_bonus + length_bonus)), 2)
 
 
 def _build_llm_prompt(messages: list[str]) -> str:

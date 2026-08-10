@@ -501,11 +501,14 @@ class ToolRegistry:
             if len(filtered) >= max_items:
                 break
 
-        # 6. 获取权威等级 + trust score，按 authority 排序
+        # 6. Bug fix (BUG-6): 批量获取权威等级 + trust score，单条 IN 查询取回全部，
+        #   避免每条记忆独立 acquire/release 连接（原实现 6 条记忆=12 次独立查询）。
+        auth_map, trust_map = await self._get_rank_meta([r.id for r in filtered])
+
         ranked = []
         for r in filtered:
-            authority = await self._get_authority_level(r.id)
-            trust_score = await self._get_trust_score(r.id)
+            authority = auth_map.get(r.id, "medium")
+            trust_score = trust_map.get(r.id, 0.5)
             ranked.append((r, authority, trust_score))
 
         auth_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -567,34 +570,36 @@ class ToolRegistry:
             self._session_injected.pop(sid, None)
             self._session_last_active.pop(sid, None)
 
-    async def _get_authority_level(self, memory_id: str) -> str:
-        """从 SQLite 获取记忆的权威等级。"""
-        try:
-            conn = await self._pool.acquire()
-            try:
-                cursor = await conn.execute(
-                    "SELECT authority FROM memories WHERE id = ?",
-                    (memory_id,),
-                )
-                row = await cursor.fetchone()
-                return row["authority"] if row else "medium"
-            finally:
-                await self._pool.release(conn)
-        except Exception:
-            return "medium"
+    async def _get_rank_meta(self, memory_ids: list[str]) -> tuple[dict[str, str], dict[str, float]]:
+        """批量获取记忆的 authority 与 trust_score（Bug fix BUG-6）。
 
-    async def _get_trust_score(self, memory_id: str) -> float:
-        """从 SQLite 获取记忆的 trust score。"""
+        单条 IN 查询取回全部，替代原先逐 id 各 acquire/release 一次连接的实现。
+
+        Args:
+            memory_ids: 记忆 id 列表
+
+        Returns:
+            (authority_map, trust_map): {id: authority}, {id: trust_score}
+        """
+        if not memory_ids:
+            return {}, {}
+        auth_map: dict[str, str] = {}
+        trust_map: dict[str, float] = {}
         try:
             conn = await self._pool.acquire()
             try:
+                placeholders = ",".join("?" * len(memory_ids))
                 cursor = await conn.execute(
-                    "SELECT trust_score FROM memories WHERE id = ?",
-                    (memory_id,),
+                    f"SELECT id, authority, trust_score FROM memories WHERE id IN ({placeholders})",
+                    memory_ids,
                 )
-                row = await cursor.fetchone()
-                return row["trust_score"] if row and row["trust_score"] is not None else 0.5
+                rows = await cursor.fetchall()
+                for row in rows:
+                    auth_map[row["id"]] = row["authority"] or "medium"
+                    trust = row["trust_score"]
+                    trust_map[row["id"]] = trust if trust is not None else 0.5
             finally:
                 await self._pool.release(conn)
         except Exception:
-            return 0.5
+            pass  # 失败时调用方用默认值兜底
+        return auth_map, trust_map

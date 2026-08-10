@@ -299,6 +299,7 @@ class PipelineEngine:
 
         # 3. 写入 ChromaDB（仅写入 SQLite 成功的消息，失败重试 1 次）
         chroma_items = [it for it in items if it["id"] in sqlite_ok_ids]
+        chroma_ok = True
         if chroma_items:
             for attempt in range(2):
                 try:
@@ -309,14 +310,35 @@ class PipelineEngine:
                         get_chroma_executor(), self._chroma.add_batch, chroma_items,
                     )
                     await asyncio.wait_for(chroma_future, timeout=30.0)
+                    chroma_ok = True
                     break
                 except asyncio.TimeoutError:
                     logger.warning("ChromaDB 写入超时（attempt %d），线程池可能耗尽", attempt + 1)
+                    chroma_ok = False
                 except Exception as e:
                     if attempt == 0:
                         logger.warning("ChromaDB 写入失败，重试: %s", e)
                     else:
                         logger.error("ChromaDB 写入重试也失败: %s", e)
+                    chroma_ok = False
+            # Bug fix (BUG-4): ChromaDB 彻底失败但 SQLite 已提交 → 孤儿记录
+            # （SQLite 有记录、ChromaDB 无向量，FTS5 搜得到但向量检索搜不到）。
+            # 回滚 SQLite 中这批没能写入 Chroma 的记忆，保证双引擎一致性。
+            if not chroma_ok:
+                logger.error("ChromaDB 写入失败，回滚 SQLite 对应记录（%d 条）避免孤儿", len(chroma_items))
+                try:
+                    conn = await self._pool.acquire()
+                    try:
+                        orphan_ids = [it["id"] for it in chroma_items]
+                        placeholders = ",".join("?" * len(orphan_ids))
+                        await conn.execute(
+                            f"DELETE FROM memories WHERE id IN ({placeholders})", orphan_ids
+                        )
+                        await conn.commit()
+                    finally:
+                        await self._pool.release(conn)
+                except Exception as e:
+                    logger.error("ChromaDB 失败后的 SQLite 回滚也出错: %s", e)
 
         # 4. 触发 L2：场景组织（仅当 SQLite 写入成功后才更新 KG，避免孤儿实体）
         # 将所有提取结果中的实体/关系/摘要合并后传给 scene organizer
