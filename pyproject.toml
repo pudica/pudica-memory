@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unified-memory"
-version = "2.5.0"
+version = "3.3.0"
 description = "pudica-Memory v2.5 — SQLite + ChromaDB 双存储记忆系统：4层管线、多策略检索（TEMPR）、知识图谱、reflect/consolidation、本地 ONNX 中文嵌入"
 readme = "README.md"
 license = {text = "MIT"}
