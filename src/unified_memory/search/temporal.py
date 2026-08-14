@@ -43,8 +43,11 @@ class TemporalRetriever:
         Returns:
             ScoredResult 列表
         """
+        # Bug fix (2026-08-13): 原实现 time_range=None 时写死最近 7 天，导致
+        # 无活跃 ingest 超过 7 天后 temporal 路永远返回空、RRF 只有 3 路工作。
+        # 改为 None 表示不限制时间范围（全部历史），仅显式传 time_range 才过滤。
         if time_range is None:
-            time_range = (time.time() - 7 * 86400, time.time())
+            time_range = (0, time.time())
 
         now = time.time()
         conn = await self._pool.acquire()

@@ -150,6 +150,22 @@ class SQLitePool:
                     tokenize='unicode61'
                 )
             """)
+        # Bug fix (2026-08-13): 旧库（v3.2.1 以前）的 memories 表可能没有
+        # authority / trust_score / summary 列。CREATE TABLE IF NOT EXISTS 不会
+        # 修改已有表，导致 engine.py 的 INSERT 报 "no such column: authority"。
+        # 这里检测缺失列并用 ALTER TABLE ADD COLUMN 逐个补齐。
+        cur = await conn.execute("PRAGMA table_info(memories)")
+        existing_cols = {r[1] for r in await cur.fetchall()}
+        for col_sql in (
+            "authority TEXT DEFAULT 'medium'",
+            "trust_score REAL DEFAULT 0.5",
+            "summary TEXT DEFAULT ''",
+        ):
+            col_name = col_sql.split()[0]
+            if col_name not in existing_cols:
+                logger.info("迁移：为 memories 表补充缺失列 %s", col_name)
+                await conn.execute(f"ALTER TABLE memories ADD COLUMN {col_sql}")
+        # 迁移后刷新已出现但为空的 authority/trust_score（旧数据默认 medium/0.5）
         # 实体表
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS entities (

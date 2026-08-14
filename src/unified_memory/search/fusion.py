@@ -76,7 +76,7 @@ class RRFusion:
                 rrf_score = weight * (1.0 / (self._k + rank))
                 accumulator[doc_id]["score"] += rrf_score
                 if sr.text not in accumulator[doc_id]["texts"]:
-                    accumulator[doc_id]["texts"].append(sr.text)
+                    accumulator[doc_id]["texts"].append(sr.text or "")
                 if strategy not in accumulator[doc_id]["sources"]:
                     accumulator[doc_id]["sources"].append(strategy)
                 if sr.metadata:

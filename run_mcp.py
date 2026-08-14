@@ -1,4 +1,4 @@
-"""pudica-Memory MCP 启动入口 — 供 Codex marketplace 调用。"""
+"""pudica-Memory MCP 启动入口 — 供 Hermes Gateway / Codex marketplace 调用（stdio 模式）。"""
 import sys
 import os
 
@@ -15,10 +15,11 @@ sys.path.insert(0, SRC_DIR)
 os.environ["PYTHONUTF8"] = "1"
 os.environ["UNIFIED_MEMORY_STORAGE_DIR"] = os.path.join(PROJECT_ROOT, "data")
 
-# 插入启动参数：用 HTTP SSE 模式启动（Hermes MCP client 走 SSE 连接）
-# --http 启动 REST API + SSE 端点，供 Hermes Gateway 的 mcp_servers 连接
-sys.argv = ["run_mcp.py", "--http", "--port", os.environ.get("UNIFIED_MEMORY_HTTP_PORT", "8420"), "--host", "127.0.0.1"]
+# 启动 MCP stdio 模式（供 Hermes Gateway 的 mcp_servers 通过 command 拉起）
+# Gateway 通过 stdin/stdout 与 MCP 通信，不走 HTTP/SSE
+from unified_memory.main import run_mcp
+from unified_memory.config import Config
 
-from unified_memory.main import main
-
-main()
+config = Config.load()
+import asyncio
+asyncio.run(run_mcp(config))

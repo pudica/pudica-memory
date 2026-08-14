@@ -152,10 +152,23 @@ class L1Extractor:
                     response_format={"type": "json_object"},
                 )
                 import json
-                result = json.loads(response)
+                # ARK 等有些 provider 返回的 JSON 被 markdown 代码块包裹
+                cleaned = response.strip()
+                if cleaned.startswith("```"):
+                    first_newline = cleaned.find("\n")
+                    if first_newline != -1:
+                        cleaned = cleaned[first_newline + 1:]
+                    if cleaned.endswith("```"):
+                        cleaned = cleaned[:-3].strip()
+                result = json.loads(cleaned)
                 result.setdefault("entities", [])
                 result.setdefault("relations", [])
                 result.setdefault("summary", "")
+                if not result["summary"]:
+                    result["summary"] = self._make_summary("\n".join(messages))
+                    logger.info("L1 LLM 未返回 summary，本地规则补全: %s", result["summary"][:40])
+                else:
+                    logger.info("L1 LLM 正常返回 summary: %s", result["summary"][:40])
                 result.setdefault("time_range", {})
                 result.setdefault("fact_type", "observation")
                 result.setdefault("confidence", 0.7)
@@ -222,6 +235,10 @@ class L1Extractor:
     def _extract_entities(self, text: str) -> list[dict]:
         """关键词实体提取（整合 MemPalace zh-CN 增强）。
 
+        Bug fix: 英文通用词（Windows、Error、Installer、UTF 等）原本被
+        英文人名/缩写规则误判为 person/org。现在对纯英文候选做停用词过滤，
+        只在确属专有名词（首字母多词组、或大缩写）时才保留。
+
         Returns:
             [{"name": "...", "type": "person|org|location|product"}, ...]
         """
@@ -236,6 +253,9 @@ class L1Extractor:
                 # MemPalace: 中文停用词过滤 —— 排除纯停用词组成的候选
                 if name in _CHINESE_STOPWORDS or all(c in _CHINESE_STOPWORDS for c in name if '\u4e00' <= c <= '\u9fff'):
                     continue
+                # Bug fix: 英文通用词过滤（Windows/Error/UTF 等误判为实体）
+                if self._is_english_generic(name):
+                    continue
                 name = self._clean_entity_name(name, ent_type)
                 if len(name) < 2:
                     continue
@@ -245,6 +265,52 @@ class L1Extractor:
 
         # 去重后取前 20 个
         return entities[:20]
+
+    _ENGLISH_GENERIC_WORDS = frozenset({
+        # 中文记忆里常出现的英文通用词/系统词，不应作为实体
+        "error", "window", "windows", "install", "installer", "dll", "utf", "utf8",
+        "user", "profile", "system", "file", "config", "api", "app", "tool", "tools",
+        "model", "models", "framework", "platform", "software", "protocol", "key",
+        "keys", "default", "true", "false", "none", "null", "test", "tests",
+        "fix", "fixed", "bug", "bugs", "debug", "code", "codes", "data", "info",
+        "info", "message", "messages", "memory", "memories", "server", "client",
+        "service", "services", "thread", "threads", "pool", "process", "processes",
+        "exe", "py", "pyinstaller",
+    })
+
+    @staticmethod
+    def _is_english_generic(name: str) -> bool:
+        """判断纯英文候选是否为通用词（非专有名词）。
+
+        Bug fix (2026-08-13): 原实现把"任何不带空格的纯英文词"一律过滤，
+        导致 GPT4、Qwen2、Claude3、Llama3 等模型名全被误杀，KG 的 product
+        实体稀疏。现在放宽：
+        - 含数字的模型名（GPT4/Qwen2/Llama3/DeepSeek-V3）→ 保留
+        - 全大写多字母缩写（NASA/IBM）→ 保留
+        - 仅字母且非通用词表、且首字母大写且 >3 字符的专有名词 → 保留
+        - 小写/混合且不在词表的普通英文 → 过滤（多为噪声）
+        """
+        lowered = name.lower()
+        # 通用词表里的 → 过滤
+        if lowered in L1Extractor._ENGLISH_GENERIC_WORDS:
+            return True
+        # 含数字的（GPT4、Qwen2、DeepSeek-V3）→ 模型/版本名，保留
+        if any(ch.isdigit() for ch in name):
+            return False
+        # 多词短语（John Smith）→ 英文人名，保留
+        if " " in name:
+            return False
+        # 全大写缩写（NASA）→ 保留
+        if name.isupper() and len(name) >= 3:
+            return False
+        # 已过滤纯符号/空
+        if not name.strip("."):
+            return True
+        # 首字母大写且大于 4 字符的专有名词 → 保留（如 Claude、Arcee）
+        if name[0].isupper() and len(name) > 4:
+            return False
+        # 其余小写普通英文 → 过滤
+        return True
 
     # 实体名清洗：剥离常见非实体前缀（用户/正在/评估等），并按后缀词定位裁剪，
     # 避免把整句（如"用户参与了云南天海科技有限公司"）当作实体名。
@@ -377,7 +443,10 @@ class L1Extractor:
             "critical" | "high" | "medium" | "low"
         """
         # 第一人称直接声明：用户自己说的，权威最高
-        first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自", "我喜欢", "我住", "我在"]
+        # 覆盖更自然的口语开头：我平时/我觉得/我最近/我每天/我主要 等
+        first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自", "我喜欢", "我住", "我在",
+                                 "我平时", "我觉得", "我最近", "我每天", "我主要", "我一直", "我一般", "我经常", "我负责",
+                                 "我养", "我有", "我需要", "我想", "我打算", "我在用", "我用", "我吃", "我去", "我来"]
         for p in first_person_patterns:
             if p in text[:200]:
                 return "critical"

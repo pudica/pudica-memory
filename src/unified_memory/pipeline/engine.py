@@ -214,16 +214,39 @@ class PipelineEngine:
     # ------------------------------------------------------------------
 
     async def _flush_buffer(self) -> None:
-        """L1：批量提取 + 写入 Chroma + SQLite + L2 场景组织。"""
+        """L1 缓冲刷新（异常安全包装）。
+
+        Bug fix (2026-08-13): 原实现整个函数无外层 try/except，若中间任何
+        步骤抛出未预期异常（如 pool.acquire() 超时），批处理已从 buffer 取出、
+        数据丢失，且 _flush_loop / _idle_flush_task 的锁内调用会连带崩。现在
+        把真正处理逻辑放入 _flush_buffer_inner，此处捕获异常并把未完成的 batch
+        数据重新放回 buffer 头部，保证不丢数据。
+        """
         if not self._buffer:
+            return
+        # 取出待处理批次（先只查看不删除，成功后由 inner 负责清理）
+        batch_to_retry = self._buffer[:self._batch_size]
+        try:
+            await self._flush_buffer_inner(batch_to_retry)
+        except Exception as e:
+            logger.error("L1 缓冲刷新失败，回滚 %d 条到 buffer: %s", len(batch_to_retry), e)
+            # 把未成功处理的批次放回 buffer 头部（若其间有新数据已追加则拼接）
+            self._buffer = batch_to_retry + \
+                [m for m in self._buffer if m.get("id") not in {m2["id"] for m2 in batch_to_retry}]
+            self.flush_count -= 1  # 未成功不计数
+
+    async def _flush_buffer_inner(self, batch: list[dict]) -> None:
+        """L1：批量提取 + 写入 Chroma + SQLite + L2 场景组织。"""
+        if not batch:
             return
 
         # 取消空闲定时器（防止与 _flush_loop 并发触发）
         if self._idle_timer and not self._idle_timer.done():
             self._idle_timer.cancel()
 
-        batch = self._buffer[:self._batch_size]
-        self._buffer = self._buffer[self._batch_size:]
+        # 从 buffer 中真正移除本次批次
+        batch_ids = {m["id"] for m in batch}
+        self._buffer = [m for m in self._buffer if m.get("id") not in batch_ids]
 
         logger.info("L1 缓冲写入: %d 条消息", len(batch))
         self.flush_count += 1
@@ -282,8 +305,8 @@ class PipelineEngine:
                     conn = await self._pool.acquire()
                     try:
                         await conn.execute(
-                                                    "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, authority, trust_score, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                                    (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, extracted.get("authority", "medium"), extracted.get("trust_score", 0.5), meta_json, msg["timestamp"], msg["timestamp"]),
+                                                    "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, authority, trust_score, summary, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                                    (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, extracted.get("authority", "medium"), extracted.get("trust_score", 0.5), extracted.get("summary", ""), meta_json, msg["timestamp"], msg["timestamp"]),
                         )
                         await conn.commit()
                         sqlite_ok_ids.add(msg["id"])
@@ -326,19 +349,24 @@ class PipelineEngine:
             # 回滚 SQLite 中这批没能写入 Chroma 的记忆，保证双引擎一致性。
             if not chroma_ok:
                 logger.error("ChromaDB 写入失败，回滚 SQLite 对应记录（%d 条）避免孤儿", len(chroma_items))
+                # Bug fix (2026-08-13): 回滚 acquire 加超时，避免连接池耗尽时
+                # 当前协程在锁内无限阻塞等连接导致死锁。超时则跳过回滚（宁可留
+                # 孤儿记录也不阻塞管线）。
                 try:
-                    conn = await self._pool.acquire()
+                    conn = await asyncio.wait_for(self._pool.acquire(), timeout=5.0)
+                except Exception as e:
+                    logger.error("ChromaDB 回滚时等待连接超时，跳过回滚: %s", e)
+                    conn = None
+                if conn is not None:
                     try:
                         orphan_ids = [it["id"] for it in chroma_items]
-                        placeholders = ",".join("?" * len(orphan_ids))
+                        placeholders = ", ".join("?" * len(orphan_ids))
                         await conn.execute(
                             f"DELETE FROM memories WHERE id IN ({placeholders})", orphan_ids
                         )
                         await conn.commit()
                     finally:
                         await self._pool.release(conn)
-                except Exception as e:
-                    logger.error("ChromaDB 失败后的 SQLite 回滚也出错: %s", e)
 
         # 4. 触发 L2：场景组织（仅当 SQLite 写入成功后才更新 KG，避免孤儿实体）
         # 将所有提取结果中的实体/关系/摘要合并后传给 scene organizer

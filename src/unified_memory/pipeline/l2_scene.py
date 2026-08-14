@@ -101,20 +101,38 @@ class L2SceneOrganizer:
 
         使用单个连接 + INSERT OR IGNORE 避免并发创建重复场景。
 
-        Args:
-            extracted: 提取结果
+        Bug fix (2026-08-13): 原实现只用第一个实体的名称做为场景名。当 L1
+        实体质量差（被裁剪为空 / 过滤掉 / 首实体是 general 类通用词）时，
+        场景名全落到 "general"，24 条记忆挤进一个场景，L2 组织形同虚设。
+        现在：
+        1. 优先用第一个"有效"实体（长度 >=2、非占位名）做为场景名；
+        2. 若实体都无效或为通用词，则从 summary 提取前 4 字做场景名（去重，
+           避免同一摘要反复建新场景）；
+        3. 兜底仍为 "general"。
 
         Returns:
             (场景 ID, 是否新建)
         """
         # 默认使用第一个实体的名称作为场景名
         scene_name = "general"
-        if extracted.get("entities"):
-            first = extracted["entities"][0]
-            if isinstance(first, dict) and "name" in first:
-                scene_name = first["name"]
-            elif isinstance(first, str):
-                scene_name = first
+        first_valid = None
+        for ent in extracted.get("entities", []):
+            name = ent.get("name") if isinstance(ent, dict) else (ent if isinstance(ent, str) else "")
+            name = name.strip() if name else ""
+            # 跳过空、过短、占位通用名
+            if len(name) >= 2 and name not in ("general", "unknown", "default"):
+                first_valid = name
+                break
+        if first_valid:
+            scene_name = first_valid
+        else:
+            # 实体无效，从 summary 前 4 字建场景名
+            summary = extracted.get("summary", "")
+            if summary and len(summary) >= 4:
+                # 去标点，取前 4 个中文字符
+                import re as _re
+                cleaned = _re.sub(r"[^\u4e00-\u9fff]", "", summary)[:4]
+                scene_name = cleaned if cleaned else "general"
 
         scene_id = str(uuid4())
         now = time.time()
@@ -156,25 +174,37 @@ class L2SceneOrganizer:
             await self._pool.release(conn)
 
     async def _update_scene_summary(self, scene_id: str, summary: str) -> None:
-        """更新场景摘要（带截断保护，防止无限增长）。
+            """更新场景摘要（带去重 + 截断保护，防止无限增长）。
 
-        Args:
-            scene_id: 场景 ID
-            summary: 新的摘要文本
-        """
-        MAX_SUMMARY_LEN = 5000
-        conn = await self._pool.acquire()
-        try:
-            await conn.execute(
-                """UPDATE scenes
-                   SET summary = substr(summary || '\n' || ?, 1, ?),
-                       updated_at = ?
-                   WHERE id = ?""",
-                (summary, MAX_SUMMARY_LEN, time.time(), scene_id),
-            )
-            await conn.commit()
-        finally:
-            await self._pool.release(conn)
+            Bug fix: 先查当前摘要，若新内容已包含在现有摘要中则跳过追加，
+            避免重复 ingest 导致内容翻倍（"我是王哥\n我是王哥"）。
+
+            Args:
+                scene_id: 场景 ID
+                summary: 新的摘要文本
+            """
+            MAX_SUMMARY_LEN = 5000
+            conn = await self._pool.acquire()
+            try:
+                # 先查当前摘要
+                cursor = await conn.execute(
+                    "SELECT summary FROM scenes WHERE id = ?",
+                    (scene_id,),
+                )
+                row = await cursor.fetchone()
+                if row and row["summary"] and summary in row["summary"]:
+                    logger.debug("L2 场景摘要已包含当前内容，跳过追加")
+                    return
+                await conn.execute(
+                    """UPDATE scenes
+                       SET summary = substr(summary || '\n' || ?, 1, ?),
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (summary, MAX_SUMMARY_LEN, time.time(), scene_id),
+                )
+                await conn.commit()
+            finally:
+                await self._pool.release(conn)
 
     async def _update_timeline(
         self, scene_id: str, time_range: dict
