@@ -11,9 +11,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class LLMConfig:
-    """LLM 调用配置。"""
+    """LLM 调用配置。
+
+    借鉴 DSH 的 apiKeyEnv 模式：配置只存环境变量名，值在运行时从环境变量读取。
+    - api_key_env: 环境变量名（如 "UNIFIED_MEMORY_LLM_API_KEY"），优先级高于 api_key
+    - api_key: 直接指定的 API key（优先级低于 api_key_env）
+    - 兼容性：api_key 可写占位符 "__UNIFIED_MEMORY_API_KEY__"，由环境变量实际填充
+    """
     api_base: str = "http://localhost:11434/v1"
     api_key: str = "ollama"
+    api_key_env: str = ""  # DSH 风格：环境变量名，如 "UNIFIED_MEMORY_LLM_API_KEY"
     model: str = "qwen2.5:7b"
     max_tokens: int = 4096
     temperature: float = 0.1
@@ -226,6 +233,8 @@ class Config:
             cfg._resolve_paths()
         # 环境变量覆盖 LLM 端点（免改 config.json，便于多智能体共用同一份代码）
         _override_env(cfg)
+        # DSH 风格：从 api_key_env 指定的环境变量读取 key
+        _resolve_api_key(cfg)
         cfg._loaded = True
         return cfg
 
@@ -288,6 +297,39 @@ def _override_env(cfg: "Config") -> None:
                 logger.warning("%s 非数字，忽略: %s", env_name, val)
                 continue
         setattr(sub, field, val)
+
+
+def _resolve_api_key(cfg: "Config") -> None:
+    """DSH 风格：从 api_key_env 指定的环境变量读取 API key。
+
+    优先级（从高到低）：
+    1. api_key_env 指定的环境变量（如 UNIFIED_MEMORY_LLM_API_KEY）
+    2. 直接指定的 api_key（非空、非占位符）
+    3. 什么都不做，保留默认值
+
+    警告：如果 api_key 是占位符且环境变量未设置，记录警告。
+    """
+    llm = cfg.llm
+
+    # 1. api_key_env 指定了环境变量名
+    if llm.api_key_env:
+        env_val = os.environ.get(llm.api_key_env)
+        if env_val:
+            logger.info("从环境变量 %s 读取 API key", llm.api_key_env)
+            llm.api_key = env_val
+            return
+        logger.warning(
+            "api_key_env=%s 指定的环境变量未设置，回退到 api_key",
+            llm.api_key_env,
+        )
+
+    # 2. 检查 api_key 是否是占位符
+    if llm.api_key and "__UNIFIED_MEMORY_API_KEY__" in llm.api_key:
+        logger.warning(
+            "API key 是占位符 '%s' 且无环境变量覆盖。"
+            "请设置 UNIFIED_MEMORY_LLM_API_KEY 环境变量或修改 config.json 中的 api_key。",
+            llm.api_key[:50],
+        )
 
 
 def _to_dict(obj: Any) -> dict:

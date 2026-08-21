@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from typing import Any, Optional
@@ -203,6 +204,11 @@ class UnifiedMemoryApp:
         await dedup.load_from_db(self.pool)
         # L1 默认走本地规则提取，LLM 作为增强（LLM 可用时自动启用增强模式）
         extractor = L1Extractor(llm=self.llm)
+        # 初始化实体注册表（白名单过滤）
+        from unified_memory.pipeline.entity_registry import EntityRegistry
+        entity_registry = EntityRegistry(self.pool)
+        await entity_registry.initialize()
+        extractor.set_registry(entity_registry)
         scene_organizer = L2SceneOrganizer(self.kg, self.pool)
 
         # 搜索组件
@@ -422,7 +428,26 @@ async def run_test(config: Config):
 # 入口点
 # ---------------------------------------------------------------------------
 
+def _clean_pycache():
+    """启动时自动清理 __pycache__ 目录，防止旧 .pyc 缓存导致改代码不生效。"""
+    src_dir = os.path.join(os.path.dirname(__file__))
+    removed = 0
+    for root, dirs, files in os.walk(src_dir):
+        if '__pycache__' in dirs:
+            p = os.path.join(root, '__pycache__')
+            try:
+                shutil.rmtree(p)
+                removed += 1
+            except Exception as e:
+                logger.warning("清理 __pycache__ 失败: %s (%s)", p, e)
+    if removed > 0:
+        logger.info("已清理 %d 个 __pycache__ 目录", removed)
+
+
 def main():
+    # 自动清理 __pycache__，防止旧 .pyc 缓存导致改代码不生效
+    _clean_pycache()
+
     parser = argparse.ArgumentParser(description="pudica-Memory — 统一记忆系统")
     parser.add_argument("--mcp", action="store_true", help="启动 MCP 服务器 (stdio 模式)")
     parser.add_argument("--http", action="store_true", help="启动 HTTP 服务器 (REST API)")
@@ -460,20 +485,38 @@ def main():
 
 
 async def run_mcp(config: Config):
-    """启动 MCP 服务器（stdio 模式）。"""
+    """启动 MCP 服务器（stdio 模式），自动重启。"""
     from unified_memory.api.mcp_server import create_mcp_server
 
-    app = UnifiedMemoryApp(config)
-    await app.initialize()
-    mcp = create_mcp_server(app)
+    restart_count = 0
+    while True:
+        app = UnifiedMemoryApp(config)
+        try:
+            await app.initialize()
+            mcp = create_mcp_server(app)
 
-    logger.info("pudica-Memory MCP 服务器启动 (stdio 模式)")
-    try:
-        await mcp.run_stdio_async()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await app.shutdown()
+            logger.info("pudica-Memory MCP 服务器启动 (stdio 模式)")
+            try:
+                await mcp.run_stdio_async()
+            except KeyboardInterrupt:
+                logger.info("MCP 服务器收到 KeyboardInterrupt，退出")
+                return
+            except Exception as e:
+                restart_count += 1
+                logger.error(
+                    "MCP 服务器异常退出 (第 %d 次重启): %s", restart_count, e,
+                    exc_info=True,
+                )
+        finally:
+            await app.shutdown()
+
+        # 重启前等待，避免死循环快速重启
+        if restart_count > 3:
+            wait = min(30, 5 * (restart_count - 3))
+            logger.info("MCP 服务器 %d 秒后自动重启...", wait)
+            await asyncio.sleep(wait)
+        else:
+            await asyncio.sleep(2)
 
 
 async def run_http(config: Config, host: str = "127.0.0.1", port: int = 8000):

@@ -9,6 +9,8 @@ import time
 from typing import Any, Optional
 from uuid import uuid4
 
+from unified_memory.pipeline.l1_extractor import GARBAGE_ENTITIES
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,8 +57,12 @@ class L2SceneOrganizer:
             if not isinstance(entity, dict) or "name" not in entity:
                 logger.debug("跳过格式异常的实体: %s", entity)
                 continue
-            await self._kg.add_entity(entity["name"], entity.get("type", "unknown"))
-            valid_entities.append(entity["name"])
+            name = entity["name"]
+            if name in GARBAGE_ENTITIES:
+                logger.debug("跳过垃圾实体（不写入 KG）: %s", name)
+                continue
+            await self._kg.add_entity(name, entity.get("type", "unknown"))
+            valid_entities.append(name)
 
         # 关联图自动填充：同轮 ingest 提取到 >=2 个实体时，两两建共现关联边。
         # 复用 add_relation_if_absent（幂等，重复共现叠加权重），同一轮的多实体

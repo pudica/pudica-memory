@@ -23,6 +23,11 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+# 弱关联谓词：co_occurs_with（L2 关联图自动填充的共现边）与 related_to
+# （consolidation 合并边）都是自动生成的噪声关联，不是 LLM 语义关系。
+# 在 kg_query 用户可见结果中过滤掉，但 get_neighbors() 仍需保留给图检索召回用。
+WEAK_PREDICATES = frozenset({"co_occurs_with", "related_to"})
+
 
 @dataclass
 class Entity:
@@ -388,6 +393,88 @@ class KnowledgeGraph:
                 await self._persist_relation(rel)
             return rel
 
+    async def delete_entity(self, name: str) -> None:
+        """删除实体及其所有关系（按名称）。
+
+        同步删除 SQLite 中该实体行，以及所有以它为端点的关系行，
+        并维护内存索引（_all_entity_names / _relations / _relation_index）。
+        """
+        async with self._lock:
+            # 收集所有以该实体为端点的关系索引
+            removed_indices = {
+                idx for idx, rel in enumerate(self._relations)
+                if rel.subject == name or rel.object == name
+            }
+            if removed_indices:
+                # 重建关系列表与关系索引（跳过被删关系）
+                new_relations: list[Relation] = []
+                new_index: dict[str, list[int]] = {}
+                for idx, rel in enumerate(self._relations):
+                    if idx in removed_indices:
+                        continue
+                    new_idx = len(new_relations)
+                    new_relations.append(rel)
+                    new_index.setdefault(rel.subject, []).append(new_idx)
+                    new_index.setdefault(rel.object, []).append(new_idx)
+                self._relations = new_relations
+                self._relation_index = new_index
+
+            # 删除实体缓存与名称集合
+            self._entities.pop(name, None)
+            self._all_entity_names.discard(name)
+
+            if self._pool:
+                conn = await self._pool.acquire()
+                try:
+                    await conn.execute(
+                        "DELETE FROM relations WHERE subject=? OR object=?",
+                        (name, name),
+                    )
+                    await conn.execute("DELETE FROM entities WHERE name=?", (name,))
+                    await conn.commit()
+                except Exception as e:
+                    logger.error("删除实体失败: %s", e)
+                finally:
+                    await self._pool.release(conn)
+
+    async def delete_relation(self, subject: str, obj: str) -> None:
+        """删除指定 (subject, object) 对的全部关系（不限谓词）。
+
+        重提取场景用：先按端点对删掉旧关系，再写入新关系，避免重复三元组累积。
+        """
+        async with self._lock:
+            removed_indices = {
+                idx for idx, rel in enumerate(self._relations)
+                if rel.subject == subject and rel.object == obj
+            }
+            if not removed_indices:
+                return
+            # 重建关系列表与关系索引（跳过被删关系）
+            new_relations: list[Relation] = []
+            new_index: dict[str, list[int]] = {}
+            for idx, rel in enumerate(self._relations):
+                if idx in removed_indices:
+                    continue
+                new_idx = len(new_relations)
+                new_relations.append(rel)
+                new_index.setdefault(rel.subject, []).append(new_idx)
+                new_index.setdefault(rel.object, []).append(new_idx)
+            self._relations = new_relations
+            self._relation_index = new_index
+
+            if self._pool:
+                conn = await self._pool.acquire()
+                try:
+                    await conn.execute(
+                        "DELETE FROM relations WHERE subject=? AND object=?",
+                        (subject, obj),
+                    )
+                    await conn.commit()
+                except Exception as e:
+                    logger.error("删除关系失败: %s", e)
+                finally:
+                    await self._pool.release(conn)
+
     async def get_relations(
         self, subject: Optional[str] = None, predicate: Optional[str] = None
     ) -> list[Relation]:
@@ -488,6 +575,44 @@ class KnowledgeGraph:
 
         sorted_scores = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         return sorted_scores[:top_k]
+
+    async def query(self, entity: str) -> dict:
+        """查询实体的完整知识图谱信息。
+
+        Args:
+            entity: 实体名称
+
+        Returns:
+            包含 entity 详情、邻居、相似实体的字典
+        """
+        entity_obj = await self.get_entity(entity)
+        if entity_obj is None:
+            return {"entity": entity, "found": False, "neighbors": [], "similar": []}
+
+        neighbors = await self.get_neighbors(entity)
+        similar = await self.get_similar_entities(entity, top_k=5)
+
+        # 区分语义关系与弱关联：co_occurs_with / related_to 是自动生成的共现/合并边，
+        # 不是 LLM 语义关系，不应淹没 kg_query 的语义结果。
+        # 仅过滤用户可见输出；get_neighbors() 本身保留给图检索召回用。
+        semantic_neighbors = []
+        weak_neighbors = []
+        for n, r in neighbors:
+            item = {"name": n, "relation": r}
+            if r in WEAK_PREDICATES:
+                weak_neighbors.append(item)
+            else:
+                semantic_neighbors.append(item)
+
+        return {
+            "entity": entity,
+            "found": True,
+            "type": entity_obj.entity_type,
+            "metadata": entity_obj.metadata,
+            "neighbors": semantic_neighbors,
+            "weak_neighbors": weak_neighbors,
+            "similar": [{"name": s[0], "score": s[1]} for s in similar],
+        }
 
     async def get_similar_entities(
         self, entity_name: str, top_k: int = 5

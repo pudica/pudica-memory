@@ -68,6 +68,31 @@ _CHINESE_STOPWORDS: set[str] = {
     "欢迎", "再见", "你好", "您好", "哈喽", "拜拜",
 }
 
+# ========================================================================
+# 垃圾实体黑名单（KG 不写入，脚本和实时管线共享）
+# 避免 L1 本地规则提取出工具名、代码路径、内部状态等非语义实体
+# ========================================================================
+GARBAGE_ENTITIES: set[str] = {
+    "normal", "DB", "KG", "3", "5", "10", "OK", "N/A",
+    "ingest_count", "search_count", "flush_count", "l1_count", "l2_count",
+    "system_health", "system_stats", "mempalace_status", "mempalace_search",
+    "mental_models_query", "memory_search", "memory_context", "memory_ingest",
+    "kg_query", "verbatim_recall", "consolidate_trigger", "memory_compress",
+    "pipeline_run", "reflect_trigger", "list_prompts", "get_prompt",
+    "list_resources", "read_resource", "mempalace_list_wings", "mempalace_list_rooms",
+    "mempalace_list_drawers", "mempalace_get_drawer", "mempalace_get_taxonomy",
+    "mempalace_add_drawer",
+    "scripts/l1_replay_all.py", "turn_context.py", "memory.provider",
+    "sync_turn", "prefetch", "pudica-memory-development",
+    "L1提取器", "L2场景组织", "引擎初始化", "MCP子进程",
+    "HTTP 8420服务", "unified_memory collection",
+    "dsh_execute_code", "dsh", "DeepSeek", "ARK", "Gateway",
+    "47.116.76.149", "Windows", "MentalModelStore",
+    "flush_count", "l1_count", "l2_count", "search_count",
+    "scripts/l1_llm_replay.py", "pudica-memory",
+    "Ark deepseek", "unified_memory",
+}
+
 # 默认关键词实体提取规则（中文命名实体关键词）
 # 整合 MemPalace zh-CN 的 entity detection 增强
 DEFAULT_ENTITY_PATTERNS: list[tuple[str, str]] = [
@@ -92,9 +117,6 @@ DEFAULT_ENTITY_PATTERNS: list[tuple[str, str]] = [
 ]
 
 # 事实类型关键词（Hindsight 4 类结构化记忆）
-# Bug fix (BUG-10): 清理重复项。
-# Bug fix (BUG-7): world 关键词移除极常见的"是/的/有/构成"等虚词，
-#   避免任何带"的"的句子误判为 world。world 仅保留明确的客观事实动词。
 FACT_TYPE_KEYWORDS: dict[str, list[str]] = {
     "observation": ["观察", "发现", "看到", "注意到", "感觉", "觉得", "现象", "情况", "状态", "天气", "今天", "外面", "这里", "那里"],
     "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成", "去过", "来过", "去了", "来了", "做了", "吃过"],
@@ -121,6 +143,12 @@ class L1Extractor:
     def __init__(self, llm: Any = None):
         self._llm = llm
         self._max_retries = 2
+        self._local_only = llm is None
+        self._registry: Optional["EntityRegistry"] = None
+
+    def set_registry(self, registry: "EntityRegistry") -> None:
+        """设置实体注册表（可选，有则启用 KG 白名单过滤）。"""
+        self._registry = registry
 
     async def extract(self, messages: list[str]) -> dict:
         """提取关键信息。
@@ -151,7 +179,6 @@ class L1Extractor:
                     prompt,
                     response_format={"type": "json_object"},
                 )
-                import json
                 # ARK 等有些 provider 返回的 JSON 被 markdown 代码块包裹
                 cleaned = response.strip()
                 if cleaned.startswith("```"):
@@ -172,9 +199,6 @@ class L1Extractor:
                 result.setdefault("time_range", {})
                 result.setdefault("fact_type", "observation")
                 result.setdefault("confidence", 0.7)
-                # Bug fix (BUG-8): LLM 路径原先不产生 authority/trust_score，
-                # 导致 engine.py 的 INSERT 用 .get() 兜底，全落 medium/0.5。
-                # 这里用本地规则为 LLM 结果补充权威等级和信任分。
                 authority = self._evaluate_authority("\n".join(messages), result["fact_type"], len(result.get("entities", [])))
                 trust_score = self._compute_trust_score(
                     result["fact_type"],
@@ -183,6 +207,9 @@ class L1Extractor:
                 )
                 result.setdefault("authority", authority)
                 result.setdefault("trust_score", trust_score)
+                # 实体注册表过滤
+                if self._registry is not None:
+                    result["entities"] = self._filter_entities_by_registry(result["entities"])
                 return result
             except Exception as e:
                 last_error = e
@@ -206,13 +233,17 @@ class L1Extractor:
         # 1. 关键词实体提取
         entities = self._extract_entities(combined)
 
-        # 2. 事实类型判断
+        # 2. 实体注册表过滤
+        if self._registry is not None:
+            entities = self._filter_entities_by_registry(entities)
+
+        # 3. 事实类型判断
         fact_type = self._classify_fact_type(combined)
 
-        # 3. 摘要（截取前 200 字，取完整句子）
+        # 4. 摘要（截取前 200 字，取完整句子）
         summary = self._make_summary(combined)
 
-        # 4. 时间戳
+        # 5. 时间戳
         now = datetime.now(timezone.utc)
         time_range = {
             "start": now.isoformat(),
@@ -221,16 +252,46 @@ class L1Extractor:
 
         return {
             "entities": entities,
-            "relations": [],  # 本地规则不提取关系
+            "relations": [],
             "summary": summary,
             "time_range": time_range,
             "fact_type": fact_type,
-            # Bug fix (BUG-5): confidence 与 trust_score 计算逻辑完全相同，
-            # 且 confidence 无对应数据库列，白算不落库。统一收敛到 trust_score，
-            # 避免冗余平行字段。上游 engine.py INSERT 只写 authority/trust_score。
             "authority": self._evaluate_authority(combined, fact_type, len(entities)),
             "trust_score": self._compute_trust_score(fact_type, len(entities), len(combined)),
         }
+
+    def _filter_entities_by_registry(self, entities: list[dict]) -> list[dict]:
+        """根据实体注册表白名单过滤实体列表。
+
+        只有注册表中 state='confirmed' 的实体才保留。
+        不在注册表中的实体，如果被标记为 rejected 则移除。
+        未知实体（不在注册表中）暂时保留，但标记为 unregistered 供后续自动发现。
+        """
+        if self._registry is None:
+            return entities
+
+        filtered = []
+        for ent in entities:
+            name = ent.get("name", "")
+            if not name:
+                continue
+            # 先检查 GARBAGE_ENTITIES 黑名单
+            if name in GARBAGE_ENTITIES:
+                continue
+            state = self._registry.get_state(name)
+            if state == "confirmed":
+                filtered.append(ent)
+            elif state == "rejected":
+                continue  # 明确拒绝的实体不写入 KG
+            else:
+                # 未知 / candidate 实体：让注册表自动发现，但不写入 KG
+                # 但保留在返回列表中（只是不太可能被后续写入 KG）
+                # 这里标记将要注册为 candidate
+                self._registry.auto_discover(name, ent.get("type", "unknown"))
+                # 未知实体暂不写入 KG，但保留在 SQLite 中
+                # 所以仍然返回，engine 会决定是否写入 KG
+                filtered.append(ent)
+        return filtered
 
     def _extract_entities(self, text: str) -> list[dict]:
         """关键词实体提取（整合 MemPalace zh-CN 增强）。
@@ -250,10 +311,13 @@ class L1Extractor:
                 name = match.group().strip()
                 if len(name) < 2:
                     continue
-                # MemPalace: 中文停用词过滤 —— 排除纯停用词组成的候选
+                # MemPalace: 中文停用词过滤
                 if name in _CHINESE_STOPWORDS or all(c in _CHINESE_STOPWORDS for c in name if '\u4e00' <= c <= '\u9fff'):
                     continue
-                # Bug fix: 英文通用词过滤（Windows/Error/UTF 等误判为实体）
+                # GARBAGE_ENTITIES 黑名单
+                if name in GARBAGE_ENTITIES:
+                    continue
+                # 英文通用词过滤
                 if self._is_english_generic(name):
                     continue
                 name = self._clean_entity_name(name, ent_type)
@@ -267,13 +331,12 @@ class L1Extractor:
         return entities[:20]
 
     _ENGLISH_GENERIC_WORDS = frozenset({
-        # 中文记忆里常出现的英文通用词/系统词，不应作为实体
         "error", "window", "windows", "install", "installer", "dll", "utf", "utf8",
         "user", "profile", "system", "file", "config", "api", "app", "tool", "tools",
         "model", "models", "framework", "platform", "software", "protocol", "key",
         "keys", "default", "true", "false", "none", "null", "test", "tests",
         "fix", "fixed", "bug", "bugs", "debug", "code", "codes", "data", "info",
-        "info", "message", "messages", "memory", "memories", "server", "client",
+        "message", "messages", "memory", "memories", "server", "client",
         "service", "services", "thread", "threads", "pool", "process", "processes",
         "exe", "py", "pyinstaller",
     })
@@ -282,7 +345,7 @@ class L1Extractor:
     def _is_english_generic(name: str) -> bool:
         """判断纯英文候选是否为通用词（非专有名词）。
 
-        Bug fix (2026-08-13): 原实现把"任何不带空格的纯英文词"一律过滤，
+        Bug fix: 原实现把"任何不带空格的纯英文词"一律过滤，
         导致 GPT4、Qwen2、Claude3、Llama3 等模型名全被误杀，KG 的 product
         实体稀疏。现在放宽：
         - 含数字的模型名（GPT4/Qwen2/Llama3/DeepSeek-V3）→ 保留
@@ -312,8 +375,7 @@ class L1Extractor:
         # 其余小写普通英文 → 过滤
         return True
 
-    # 实体名清洗：剥离常见非实体前缀（用户/正在/评估等），并按后缀词定位裁剪，
-    # 避免把整句（如"用户参与了云南天海科技有限公司"）当作实体名。
+    # 实体名清洗：剥离常见非实体前缀，并按后缀词定位裁剪
     _NOISE_PREFIXES: tuple[str, ...] = (
         "用户", "我们", "我", "正在", "已经", "开始", "继续", "需要", "可以",
         "希望", "评估", "测试", "进行", "使用", "通过", "完成", "负责",
@@ -329,7 +391,6 @@ class L1Extractor:
         "还有", "也是", "就是", "作为", "成为", "属于", "位于",
         "这个", "那个", "这些", "那些", "某个", "一些", "每个",
     )
-    # 各实体类型的后缀词（避免跨类型串扰，如 person 的"老师"误裁剪 location 实体）
     _TYPE_SUFFIXES: dict[str, tuple[str, ...]] = {
         "person": ("医生", "大夫", "老师", "先生", "女士", "同志"),
         "org": ("有限公司", "研究院", "基金会", "中心", "公司", "集团", "医院",
@@ -342,9 +403,6 @@ class L1Extractor:
     _SUFFIX_WORDS: tuple[str, ...] = tuple(
         sorted({s for v in _TYPE_SUFFIXES.values() for s in v}, key=len, reverse=True)
     )
-    # Bug fix (BUG-9): product 类型下这些词+产品后缀是合法真实产品名
-    # （如"管理系统"、"评估平台"），不能被当作噪声前缀剥掉。
-    # 原实现无限循环剥前缀 → "管理系统"被剥成"系统"，丢失真实实体名。
     _PRODUCT_SAFE_PREFIXES = frozenset({
         "评估", "测试", "管理", "开发", "服务", "支持", "使用", "研究",
         "建设", "运营", "提供", "实现", "打造", "学习", "分析", "监控",
@@ -353,34 +411,28 @@ class L1Extractor:
 
     def _clean_entity_name(self, name: str, ent_type: str = "org") -> str:
         """剥离常见非实体前缀 + 按实体类型后缀词裁剪，保留紧凑实体名。"""
-        # 1. 循环剥离非实体前缀（"用户参与了X公司" -> "X公司"）
-        # person 类型特判：单字姓氏+单字名但实际是常见产品名
+        # 1. 循环剥离非实体前缀
         if ent_type == "person" and name in ("方案", "系统", "平台", "模型", "框架", "引擎", "管线", "器具", "工具"):
             return ""
         changed = True
-        # 防死循环：最多剥 6 轮（Bug fix BUG-9）
         guard = 0
         while changed and len(name) > 2 and guard < 6:
             guard += 1
             changed = False
             for p in self._NOISE_PREFIXES:
-                # Bug fix (BUG-9): product 类型跳过"产品安全前缀"（如"管理"），
-                # 否则"管理系统" → "系统"。其余类型继续剥。
                 if p in self._PRODUCT_SAFE_PREFIXES and ent_type == "product":
                     continue
                 if name.startswith(p) and len(name) > len(p) + 1:
                     name = name[len(p):]
                     changed = True
                     break
-        # 2. 按类型后缀定位：只保留最后一个后缀词及其前最多 8 个汉字
-        # 特判：剥离言语动词（"王哥认为"->"王哥"，"何总工认为云南省"->"何总工"）
+        # 2. 按类型后缀定位
         for v in sorted(_CHINESE_PERSON_VERBS, key=len, reverse=True):
             if v in name and len(name) > len(v):
                 idx = name.find(v)
                 if idx > 0:
                     name = name[:idx]
                 break
-        # person 类型特判：尾部剥离"也"等助词（"王哥也" -> "王哥"）
         if ent_type == "person" and name.endswith("也"):
             name = name[:-1]
         suffixes = self._TYPE_SUFFIXES.get(ent_type, self._SUFFIX_WORDS)
@@ -388,13 +440,10 @@ class L1Extractor:
             idx = name.rfind(suffix)
             if idx > 0:
                 head = name[max(0, idx - 8):idx]
-                # 实体名通常从"的/在/跟"等分隔词之后开始（如"云岭集团的量子计算平台"、
-                # "王老师在云南省昆明市"、"陈主任跟赵局长"），截断到最后一个分隔符之后
                 for sep in ("的", "在", "跟", "到", "去", "来"):
                     if sep in head:
                         head = head.split(sep)[-1]
                 cleaned = head + suffix
-                # 若裁剪后反而更短则接受，否则保留原名（避免过度裁剪）
                 if len(cleaned) < len(name):
                     name = cleaned
                 break
@@ -416,7 +465,6 @@ class L1Extractor:
         if len(text) <= max_chars:
             return text
         truncated = text[:max_chars]
-        # 找最后一个句号/问号/感叹号/换行
         last_punct = max(
             truncated.rfind("。"),
             truncated.rfind("？"),
@@ -428,22 +476,7 @@ class L1Extractor:
         return truncated
 
     def _evaluate_authority(self, text: str, fact_type: str, entity_count: int) -> str:
-        """评估记忆的权威等级（Ground Truth 层级）。
-
-        规则（Bug fix BUG-1/2: 提升区分度，摆脱对 fact_type 的过度依赖）：
-        - 第一人称直接声明（我是/我叫/我的/我喜欢等）→ critical
-        - 明确的个人经历动词（我做过/我用过/我吃过等）→ critical
-        - 客观事实（world）或高实体数的具体陈述（实体≥3）→ high
-        - 有实体的观察/经历（实体≥1）→ medium
-        - 观察、或一般性陈述（observation）→ medium
-        - 主观意见（opinion）、无实体的空泛观察 → low
-        - 默认 → medium
-
-        Returns:
-            "critical" | "high" | "medium" | "low"
-        """
-        # 第一人称直接声明：用户自己说的，权威最高
-        # 覆盖更自然的口语开头：我平时/我觉得/我最近/我每天/我主要 等
+        """评估记忆的权威等级（Ground Truth 层级）。"""
         first_person_patterns = ["我是", "我叫", "我的", "我姓", "我住在", "我工作", "我今年", "我来自", "我喜欢", "我住", "我在",
                                  "我平时", "我觉得", "我最近", "我每天", "我主要", "我一直", "我一般", "我经常", "我负责",
                                  "我养", "我有", "我需要", "我想", "我打算", "我在用", "我用", "我吃", "我去", "我来"]
@@ -451,13 +484,11 @@ class L1Extractor:
             if p in text[:200]:
                 return "critical"
 
-        # 明确的个人经历动词 → critical（用户亲历可作第一手凭证）
         experience_verbs = ["我做过", "我用过", "我吃过", "我去过", "我试过", "我用了", "我做了", "我完成了"]
         for v in experience_verbs:
             if v in text[:300]:
                 return "critical"
 
-        # 客观事实（world）或具体实体陈述（≥3 个实体）→ high
         if fact_type == "world" and entity_count >= 1:
             return "high"
         if entity_count >= 3:
@@ -465,52 +496,33 @@ class L1Extractor:
         if fact_type == "experience":
             return "high"
 
-        # 有实体的观察/普通陈述 → medium
         if entity_count >= 1:
             return "medium"
         if fact_type == "observation":
             return "medium"
 
-        # 主观意见、或完全无实体的空泛内容 → low
         if fact_type == "opinion":
             return "low"
 
         return "medium"
 
     def _compute_trust_score(self, fact_type: str, entity_count: int, text_length: int) -> float:
-        """计算记忆的 trust score（0-1）。
-
-        综合考量：
-        - 事实类型的基础置信度
-        - 实体数量（越多越可靠，但不超过 5 个）
-        - 文本长度（50-500 字为最佳区间）
-
-        Bug fix (BUG-2): 恢复区分度。原先因 world 关键词误判导致大量文本
-        落 world(0.9)，trust 全被拉高到接近 0.9；现在 world 关键词收紧后
-        分布自然回落。仍按类型*实体*长度加权。
-
-        Returns:
-            0-1 之间的 trust score
-        """
+        """计算记忆的 trust score（0-1）。"""
         base = FACT_TYPE_CONFIDENCE.get(fact_type, 0.5)
-        # 实体数量加成（最多 +0.15）
         entity_bonus = min(0.15, entity_count * 0.03)
-        # 文本长度加成
         if 50 <= text_length <= 500:
             length_bonus = 0.1
         elif text_length < 20:
-            length_bonus = -0.15  # 过短惩罚
+            length_bonus = -0.15
         elif text_length > 2000:
-            length_bonus = -0.05  # 过长噪声
+            length_bonus = -0.05
         else:
             length_bonus = 0.0
-        # 落到 2 位小数，便于区分（Bug fix: 避免出现 0.8099999 这类浮点尾差）
         return round(max(0.1, min(1.0, base + entity_bonus + length_bonus)), 2)
 
 
 def _build_llm_prompt(messages: list[str]) -> str:
     """构建 LLM 提取提示词。"""
-    import json
     return f"""从以下对话中提取关键信息，返回 JSON 格式：
 
 对话内容：

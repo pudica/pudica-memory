@@ -481,3 +481,37 @@ class MentalModelStore:
             "total_conflicts": total_conflicts,
             "conflicted_beliefs": conflicted,
         }
+
+    async def query(self, query_str: str = "", top_k: int = 10) -> list[dict]:
+        """查询心智模型信念。
+
+        Args:
+            query_str: 可选的查询关键词（按 category 和 key 模糊匹配）
+            top_k: 返回条数上限
+
+        Returns:
+            匹配的信念列表
+        """
+        beliefs = list(self._cache.values())
+        if query_str:
+            q = query_str.lower()
+            matched = [
+                b for b in beliefs
+                if q in b.category.lower() or q in b.key.lower() or q in b.value.lower()
+            ]
+        else:
+            matched = sorted(beliefs, key=lambda b: b.confidence, reverse=True)
+
+        matched = matched[:top_k]
+        return [
+            {
+                "category": b.category,
+                "key": b.key,
+                "value": b.value,
+                "confidence": b.confidence,
+                "evidence_count": b.evidence_count,
+                "conflict_count": b.conflict_count,
+                "updated_at": b.updated_at,
+            }
+            for b in matched
+        ]

@@ -96,8 +96,8 @@ def _hnsw_params(collection_size: int = 0) -> dict[str, Any]:
 def get_embedder() -> Any:
     """获取缓存的 embedding function，全局只加载一次模型。
 
-    使用 BAAI/bge-small-zh-v1.5 中文语义模型（512维）。
-    参考 mempalace `embedding.py` 的 `_EF_CACHE` 全局缓存模式。
+    使用 ONNX 本地中文嵌入器（BAAI/bge-small-zh-v1.5，512维），
+    固定单一路径，无回退链。加载失败即报错，防止静默降级到 384 维。
     """
     global _EF_DIMENSION
     cache_key = "default"
@@ -108,57 +108,19 @@ def get_embedder() -> Any:
         cached = _EF_CACHE.get(cache_key)
         if cached is not None:
             return cached
-        # 首选：本地 bge-small-zh ONNX 中文嵌入器（免 torch、免网络下载、CPU 可跑）
-        try:
-            from unified_memory.store.onnx_zh_embedder import get_bge_onnx_embedding_function
+        # 固定路径：ONNX 本地中文嵌入器（免 torch、免网络下载、CPU 可跑）
+        from unified_memory.store.onnx_zh_embedder import get_bge_onnx_embedding_function
 
-            onnx_ef = get_bge_onnx_embedding_function()
-            if onnx_ef is not None:
-                _EF_DIMENSION = 512  # Bug fix: 现在在 _EF_CACHE_LOCK 保护内写入
-                _EF_CACHE[cache_key] = onnx_ef
-                return onnx_ef
-        except Exception as e:  # noqa: BLE001
-            logger.warning("bge ONNX 中文嵌入器加载失败，走原回退链: %s", e)
-        # 原回退链：bge-small-zh (sentence-transformers) -> ONNXMiniLM_L6_V2
-        # 优先使用本地缓存的 bge-small-zh-v1.5
-        model_name = "BAAI/bge-small-zh-v1.5"
-        try:
-            os.environ["TRANSFORMERS_OFFLINE"] = "1"
-            from sentence_transformers import SentenceTransformer
-            st = SentenceTransformer(model_name, local_files_only=True)
-            _EF_DIMENSION = 512
-            # 包装为 chromadb 可用的 EmbeddingFunction
-            ef = _SentenceTransformerWrapper(st)
-            _EF_CACHE[cache_key] = ef
-            logger.info("嵌入器已加载: %s (dim=%d, local)", model_name, _EF_DIMENSION)
-            return ef
-        except Exception as e:
-            logger.warning("bge-small-zh 本地加载失败 (%s), 尝试在线加载...", e)
-            # 清除 OFFLINE 标志，让 fallback 能正常下载
-            if "TRANSFORMERS_OFFLINE" in os.environ:
-                del os.environ["TRANSFORMERS_OFFLINE"]
-            try:
-                from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-                ef = SentenceTransformerEmbeddingFunction(model_name=model_name)
-                _EF_DIMENSION = 512
-                _EF_CACHE[cache_key] = ef
-                logger.info("嵌入器已加载: %s (dim=%d, online)", model_name, _EF_DIMENSION)
-                return ef
-            except Exception as e2:
-                logger.warning("bge-small-zh 在线加载也失败 (%s), 回退到 ONNXMiniLM_L6_V2", e2)
-                ef = ONNXMiniLM_L6_V2(preferred_providers=["CPUExecutionProvider"])
-                fallback_dim = 384
-                # 如果之前已用 512 维创建了集合，回退到 384 维会导致维度不匹配
-                if _EF_DIMENSION != fallback_dim:
-                    logger.error(
-                        "嵌入器维度不匹配：已用 %d 维创建集合，但回退嵌入器为 %d 维。"
-                        "请删除 ChromaDB 持久化目录后重启以重建集合。",
-                        _EF_DIMENSION, fallback_dim,
-                    )
-                _EF_DIMENSION = fallback_dim
-                _EF_CACHE[cache_key] = ef
-                logger.info("嵌入器已加载: ONNXMiniLM_L6_V2 (fallback, dim=%d)", fallback_dim)
-                return ef
+        onnx_ef = get_bge_onnx_embedding_function()
+        if onnx_ef is None:
+            raise RuntimeError(
+                "ONNX 嵌入器加载失败（get_bge_onnx_embedding_function 返回 None）。"
+                "请检查 onnx_zh_embedder.py 的模型文件路径是否正确。"
+            )
+        _EF_DIMENSION = 512
+        _EF_CACHE[cache_key] = onnx_ef
+        logger.info("嵌入器已加载: ONNX bge-small-zh-v1.5 (dim=%d, 固定路径)", _EF_DIMENSION)
+        return onnx_ef
 
 
 # ---------------------------------------------------------------------------
