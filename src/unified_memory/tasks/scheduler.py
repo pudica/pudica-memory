@@ -40,6 +40,7 @@ class TaskScheduler:
         persona_distiller: Any = None,
         persona_interval_hours: int = 24,
         clean_expiry_interval_hours: int = 6,
+        sqlite_store: Any = None,  # 用于记忆过期清理（v3.4.1）
     ):
         """
         Args:
@@ -62,6 +63,7 @@ class TaskScheduler:
         self._persona_distiller = persona_distiller
         self._persona_interval = persona_interval_hours
         self._clean_expiry_interval = clean_expiry_interval_hours
+        self._sqlite_store = sqlite_store
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -159,9 +161,16 @@ class TaskScheduler:
                     deleted = await self._persona_distiller.clean_expired()
                     self.clean_expiry_count += 1
                     self.last_clean_expiry_time = now.timestamp()
-                    logger.info("过期清理完成: 删除 %d 条", deleted)
+                    logger.info("过期清理完成: persona 删除 %d 条", deleted)
                 except Exception as e:
-                    logger.error("过期清理失败: %s", e)
+                    logger.error("Persona 过期清理失败: %s", e)
+                if self._sqlite_store:
+                    try:
+                        mem_deleted = await self._sqlite_store.clean_expired_memories()
+                        if mem_deleted:
+                            logger.info("过期清理完成: 记忆删除 %d 条", mem_deleted)
+                    except Exception as e:
+                        logger.error("记忆过期清理失败: %s", e)
                 next_clean = now + timedelta(hours=self._clean_expiry_interval)
 
             await asyncio.sleep(60)

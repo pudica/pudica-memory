@@ -629,6 +629,30 @@ class SQLiteStore:
                     (wing, limit),
                 )
             rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+        finally:
+            await self._pool.release(conn)
+
+    async def clean_expired_memories(self, now: Optional[float] = None) -> int:
+        """清理过期的记忆（expires_at 不为空且小于当前时间）。
+
+        Args:
+            now: 当前时间戳（默认 time.time()）
+
+        Returns:
+            删除的记忆条数
+        """
+        if now is None:
+            now = time.time()
+        conn = await self._pool.acquire()
+        try:
+            cursor = await conn.execute(
+                "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            deleted = cursor.rowcount
+            await conn.commit()
+            if deleted:
+                logger.info("清理 %d 条过期记忆", deleted)
+            return deleted
         finally:
             await self._pool.release(conn)
