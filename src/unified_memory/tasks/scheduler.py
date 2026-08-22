@@ -166,9 +166,18 @@ class TaskScheduler:
                     logger.error("Persona 过期清理失败: %s", e)
                 if self._sqlite_store:
                     try:
-                        mem_deleted = await self._sqlite_store.clean_expired_memories()
-                        if mem_deleted:
-                            logger.info("过期清理完成: 记忆删除 %d 条", mem_deleted)
+                        conn = await self._sqlite_store.acquire()
+                        try:
+                            cursor = await conn.execute(
+                                "DELETE FROM memories WHERE expires_at IS NOT NULL AND expires_at < ?",
+                                (time.time(),),
+                            )
+                            mem_deleted = cursor.rowcount
+                            await conn.commit()
+                            if mem_deleted:
+                                logger.info("记忆过期清理完成: 删除 %d 条", mem_deleted)
+                        finally:
+                            await self._sqlite_store.release(conn)
                     except Exception as e:
                         logger.error("记忆过期清理失败: %s", e)
                 next_clean = now + timedelta(hours=self._clean_expiry_interval)
