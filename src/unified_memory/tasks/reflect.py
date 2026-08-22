@@ -1,6 +1,7 @@
 """tasks/reflect.py — Reflect 任务：单次 LLM 调用，三级检索，批量更新。
 
 参考文档 7.4 节 Reflector 实现 + hindsight reflect/agent.py 的完整流程。
+v3.4.0 新增：disposition 语气推断输出。
 """
 
 import asyncio
@@ -54,6 +55,10 @@ REFLECT_PROMPT = """# 反思任务
 基于记忆片段，更新用户偏好/信念/行为模式。
 格式: {{"category": "preference|belief|behavior|knowledge_level", "key": "...", "value": "...", "confidence_delta": 0.1}}
 
+### 6. 语气/倾向推断（Disposition）
+基于记忆片段，推断用户的当前倾向（语气、情绪、交流风格）。
+格式: {{"disposition": "positive|neutral|negative|analytical|urgent", "confidence": 0.0~1.0, "reason": "..."}}
+
 ## 输出格式
 ```json
 {{
@@ -71,9 +76,13 @@ REFLECT_PROMPT = """# 反思任务
   ],
   "mental_model_updates": [
     {{"category": "preference", "key": "...", "value": "...", "confidence_delta": 0.1}}
-  ]
-}}
-```"""
+  ],
+  "disposition": {{
+    "disposition": "positive|neutral|negative|analytical|urgent",
+    "confidence": 0.0~1.0,
+    "reason": "..."
+  }}
+}}"""
 
 
 class Reflector:
@@ -84,6 +93,7 @@ class Reflector:
     2. 三级检索：entity → time → random（类似 hindsight 的 pockets 检索）
     3. 单次 LLM 调用生成洞察
     4. 批量更新知识图谱
+    v3.4.0：新增 disposition 输出
     """
 
     def __init__(
@@ -95,15 +105,6 @@ class Reflector:
         mental_models: Any = None,
         settings: Optional[dict] = None,
     ):
-        """
-        Args:
-            llm: LLM 调用接口
-            kg: KnowledgeGraph 实例
-            chroma: ChromaStore 实例
-            pool: SQLitePool 实例
-            mental_models: MentalModelStore 实例（Hindsight: 信念系统）
-            settings: 可选配置（max_retries, extract_window 等）
-        """
         self._llm = llm
         self._kg = kg
         self._chroma = chroma
@@ -118,7 +119,7 @@ class Reflector:
 
         Returns:
             {"insights": [...], "gaps": [...], "cross_scene_links": [...],
-             "kg_updates": [...], "stats": {...}}
+             "kg_updates": [...], "disposition": {...}, "stats": {...}}
         """
         logger.info("开始 Reflect 任务")
 
@@ -127,7 +128,7 @@ class Reflector:
 
         if not context:
             logger.warning("Reflect 检索无上下文，跳过")
-            return {"insights": [], "gaps": [], "cross_scene_links": [], "kg_updates": [], "stats": {}}
+            return {"insights": [], "gaps": [], "cross_scene_links": [], "kg_updates": [], "disposition": {}, "stats": {}}
 
         # 2. 单次 LLM 调用
         result = await self._call_llm(context)
@@ -144,31 +145,28 @@ class Reflector:
         if self._mental_models:
             await self._mental_models.decay_beliefs(decay_factor=0.98)
 
+        # 6. 提取 disposition
+        disposition = result.get("disposition", {})
+        if not isinstance(disposition, dict):
+            disposition = {}
+
         result["stats"] = {
             "context_size": len(context),
             "kg_updates_applied": stats,
             "mental_model_updates": mm_stats,
         }
+        result["disposition"] = disposition
 
-        # 6. 写入 reflect 记录
+        # 7. 写入 reflect 记录
         await self._log_reflect(result)
 
-        logger.info("Reflect 完成: %d 洞察, %d 知识缺口, %d KG 更新",
-                     len(result.get("insights", [])),
-                     len(result.get("gaps", [])),
-                     stats)
+        logger.info("Reflect 完成: %d 洞察, %d KG 更新, disposition=%s",
+                     len(result.get("insights", [])), stats,
+                     disposition.get("disposition", "none"))
         return result
 
     async def _retrieve_context(self) -> str:
-        """三级检索：entity → time → random。
-
-        1. 优先从活跃实体获取上下文
-        2. 最近时间窗口检索
-        3. 随机采样补充
-
-        Returns:
-            拼接后的上下文文本
-        """
+        """三级检索：entity → time → random。"""
         parts: list[str] = []
 
         # 一级：活跃实体
@@ -210,15 +208,7 @@ class Reflector:
         return "\n".join(parts)
 
     async def _call_llm(self, context: str) -> dict:
-        """单次 LLM 调用。
-
-        Args:
-            context: 检索到的上下文文本
-
-        Returns:
-            LLM 返回的 JSON 结果
-        """
-        # Hindsight: 注入当前心智模型到提示词
+        """单次 LLM 调用。"""
         mental_models_text = ""
         if self._mental_models:
             mental_models_text = await self._mental_models.format_for_context(max_items=15)
@@ -239,6 +229,7 @@ class Reflector:
                 result.setdefault("cross_scene_links", [])
                 result.setdefault("kg_updates", [])
                 result.setdefault("mental_model_updates", [])
+                result.setdefault("disposition", {})
                 return result
             except Exception as e:
                 logger.warning("Reflect LLM 调用失败 (尝试 %d/%d): %s",
@@ -246,17 +237,10 @@ class Reflector:
                 if attempt < self._max_retries - 1:
                     await asyncio.sleep(1 * (attempt + 1))
 
-        return {"insights": [], "gaps": [], "cross_scene_links": [], "kg_updates": [], "mental_model_updates": []}
+        return {"insights": [], "gaps": [], "cross_scene_links": [], "kg_updates": [], "mental_model_updates": [], "disposition": {}}
 
     async def _apply_kg_updates(self, updates: list[dict]) -> int:
-        """批量更新知识图谱。
-
-        Args:
-            updates: [{action, subject, predicate, object, ...}]
-
-        Returns:
-            成功更新的数量
-        """
+        """批量更新知识图谱。"""
         count = 0
         for update in updates:
             try:
@@ -282,14 +266,7 @@ class Reflector:
         return count
 
     async def _apply_mental_model_updates(self, updates: list[dict]) -> int:
-        """批量更新心智模型（Hindsight: Mental Models）。
-
-        Args:
-            updates: [{category, key, value, confidence_delta}]
-
-        Returns:
-            成功更新的数量
-        """
+        """批量更新心智模型。"""
         if not self._mental_models or not updates:
             return 0
         count = 0
@@ -310,7 +287,6 @@ class Reflector:
         """记录 reflect 结果到日志表。"""
         conn = await self._pool.acquire()
         try:
-            # 自动建表（如果不存在）
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS reflect_logs (
                     id TEXT PRIMARY KEY,

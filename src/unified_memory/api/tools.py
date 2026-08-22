@@ -189,6 +189,24 @@ class ToolRegistry:
         self._register("memory_compress", self._memory_compress,
                        "手动触发记忆压缩", {}, auth_level="system")
 
+        # ---- P1: 事实冲突检测与合并 ----
+        self._register("kg_detect_conflicts", self._kg_detect_conflicts,
+                       "检测 KG 实体 type 冲突", {}, auth_level="readonly")
+        self._register("kg_merge_conflicts", self._kg_merge_conflicts,
+                       "合并 KG 实体 type 冲突（保留高频 type）",
+                       {"dry_run": "bool (optional, default=true)"},
+                       auth_level="system")
+
+        # ---- P2: 场景组织增强 ----
+        self._register("scene_list", self._scene_list,
+                       "列出所有场景",
+                       {"limit": "int (optional)", "offset": "int (optional)"},
+                       auth_level="readonly")
+        self._register("scene_merge", self._scene_merge,
+                       "合并相似场景",
+                       {"scene_id_a": "str", "scene_id_b": "str"},
+                       auth_level="system")
+
     def _register(self, name: str, handler: Any, description: str, params: dict,
                   auth_level: str = "readonly") -> None:
         """注册单个工具，带认证级别。"""
@@ -389,25 +407,25 @@ class ToolRegistry:
         return {"status": "consolidation_triggered"}
 
     async def _system_health(self) -> dict:
-            """系统健康检查。"""
-            # 从 DB 读真实计数（engine.ingest_count 在 MCP 子进程可能为 0）
-            db_count = 0
+        """系统健康检查。"""
+        # 从 DB 读真实计数（engine.ingest_count 在 MCP 子进程可能为 0）
+        db_count = 0
+        try:
+            conn = await self._pool.acquire()
             try:
-                conn = await self._pool.acquire()
-                try:
-                    cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
-                    row = await cursor.fetchone()
-                    db_count = row["count"] if row else 0
-                finally:
-                    await self._pool.release(conn)
-            except Exception:
-                pass
-            return {
-                "status": "healthy",
-                "engine_running": self._engine.is_running(),
-                "total_memories": db_count,
-                "buffer_size": len(self._engine._buffer) if hasattr(self._engine, '_buffer') else 0,
-            }
+                cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
+                row = await cursor.fetchone()
+                db_count = row["count"] if row else 0
+            finally:
+                await self._pool.release(conn)
+        except Exception:
+            pass
+        return {
+            "status": "healthy",
+            "engine_running": self._engine.is_running(),
+            "total_memories": db_count,
+            "buffer_size": len(self._engine._buffer) if hasattr(self._engine, '_buffer') else 0,
+        }
 
     async def _system_stats(self) -> dict:
         """系统统计。"""
@@ -430,13 +448,13 @@ class ToolRegistry:
     # ---- v3.0 新增工具（Hindsight + MemPalace） ----
 
     async def _mental_models_query(self, category: str = "", key: str = "") -> dict:
-            """查询用户心智模型/信念。"""
-            if self._mental_models is None:
-                return {"error": "mental_models not available"}
-            # 组合 category 和 key 为查询字符串
-            query_str = f"{category} {key}".strip()
-            results = await self._mental_models.query(query_str=query_str, top_k=20)
-            return {"results": results}
+        """查询用户心智模型/信念。"""
+        if self._mental_models is None:
+            return {"error": "mental_models not available"}
+        # 组合 category 和 key 为查询字符串
+        query_str = f"{category} {key}".strip()
+        results = await self._mental_models.query(query_str=query_str, top_k=20)
+        return {"results": results}
 
     async def _mental_models_strong(self, min_confidence: float = 0.8) -> dict:
         """获取高置信度信念。"""
@@ -554,3 +572,72 @@ class ToolRegistry:
             return {"error": "EntityRegistry not initialized"}
         confirmed = await reg.list_confirmed()
         return {"confirmed": confirmed, "total": len(confirmed)}
+
+    # ---- P1: 事实冲突检测与合并 ----
+
+    async def _kg_detect_conflicts(self) -> dict:
+        """检测 KG 实体 type 冲突。"""
+        if not hasattr(self._kg, 'get_entity_type_conflicts'):
+            return {"error": "KG does not support get_entity_type_conflicts"}
+        conflicts = await self._kg.get_entity_type_conflicts()
+        return {"conflicts": conflicts, "total": len(conflicts)}
+
+    async def _kg_merge_conflicts(self, dry_run: bool = True) -> dict:
+        """合并 KG 实体 type 冲突（保留高频 type）。"""
+        if not hasattr(self._kg, 'merge_entity_conflicts'):
+            return {"error": "KG does not support merge_entity_conflicts"}
+        result = await self._kg.merge_entity_conflicts(dry_run=dry_run)
+        return {"status": "dry_run" if dry_run else "merged", "result": result}
+
+    # ---- P2: 场景组织增强 ----
+
+    async def _scene_list(self, limit: int = 50, offset: int = 0) -> dict:
+        """列出所有场景。"""
+        conn = await self._pool.acquire()
+        try:
+            cursor = await conn.execute(
+                "SELECT id, summary, entity_count, created_at, updated_at FROM scenes ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (limit, offset))
+            rows = await cursor.fetchall()
+            scenes = [
+                {
+                    "id": row["id"],
+                    "summary": row["summary"][:200] if row["summary"] else "",
+                    "entity_count": row["entity_count"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in rows
+            ]
+            cursor2 = await conn.execute("SELECT COUNT(*) AS count FROM scenes")
+            total = (await cursor2.fetchone())["count"]
+            return {"scenes": scenes, "total": total, "offset": offset, "limit": limit}
+        finally:
+            await self._pool.release(conn)
+
+    async def _scene_merge(self, scene_id_a: str, scene_id_b: str) -> dict:
+        """合并两个场景（保留场景 A，将 B 的记忆迁移到 A 后删除 B）。"""
+        conn = await self._pool.acquire()
+        try:
+            # 1. 检查两个场景都存在
+            cursor = await conn.execute(
+                "SELECT id, summary FROM scenes WHERE id IN (?, ?)", (scene_id_a, scene_id_b))
+            rows = await cursor.fetchall()
+            ids_found = {row["id"] for row in rows}
+            if scene_id_a not in ids_found:
+                return {"error": f"scene {scene_id_a} not found"}
+            if scene_id_b not in ids_found:
+                return {"error": f"scene {scene_id_b} not found"}
+
+            # 2. 迁移场景 B 的记忆到场景 A
+            await conn.execute(
+                "UPDATE memories SET scene_id = ? WHERE scene_id = ?",
+                (scene_id_a, scene_id_b))
+
+            # 3. 删除场景 B
+            await conn.execute("DELETE FROM scenes WHERE id = ?", (scene_id_b,))
+
+            await conn.commit()
+            return {"status": "merged", "kept": scene_id_a, "removed": scene_id_b}
+        finally:
+            await self._pool.release(conn)

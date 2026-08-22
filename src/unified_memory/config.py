@@ -132,8 +132,12 @@ class TaskConfig:
 
 @dataclass
 class Config:
-    """统一记忆系统全局配置。"""
+    """统一记忆系统全局配置。
+
+    v3.4.0 新增：agent_id（多 agent 隔离）。
+    """
     data_dir: str = ""
+    agent_id: str = "default"  # 多 agent 隔离标识（v3.4.0）
     llm: LLMConfig = field(default_factory=LLMConfig)
     sqlite: SQLiteConfig = field(default_factory=SQLiteConfig)
     chroma: ChromaConfig = field(default_factory=ChromaConfig)

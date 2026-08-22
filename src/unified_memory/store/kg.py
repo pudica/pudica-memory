@@ -393,6 +393,102 @@ class KnowledgeGraph:
                 await self._persist_relation(rel)
             return rel
 
+    # ------------------------------------------------------------------
+    # P1: 事实冲突检测 + 合并
+    # ------------------------------------------------------------------
+
+    async def get_entity_type_conflicts(self) -> list[dict]:
+        """检测同一实体在 DB 中存在多个不同 entity_type 的冲突。
+
+        Returns:
+            [{"entity": name, "types": [type1, type2, ...], "counts": {type: count}}, ...]
+        """
+        if not self._pool:
+            return []
+        conn = await self._pool.acquire()
+        try:
+            cursor = await conn.execute(
+                """SELECT name, entity_type, COUNT(*) as cnt
+                   FROM entities
+                   GROUP BY name, entity_type
+                   HAVING cnt > 0
+                   ORDER BY name"""
+            )
+            # 解析分组结果
+            entity_types: dict[str, dict[str, int]] = {}
+            rows = await cursor.fetchall()
+            for row in rows:
+                name = row["name"]
+                etype = row["entity_type"]
+                cnt = row["cnt"]
+                if name not in entity_types:
+                    entity_types[name] = {}
+                entity_types[name][etype] = entity_types[name].get(etype, 0) + cnt
+
+            conflicts = []
+            for name, types in entity_types.items():
+                if len(types) > 1:
+                    conflicts.append({
+                        "entity": name,
+                        "types": list(types.keys()),
+                        "counts": types,
+                    })
+            return conflicts
+        finally:
+            await self._pool.release(conn)
+
+    async def merge_entity_conflicts(self, dry_run: bool = True) -> dict:
+        """合并同一实体的多个 type 冲突（保留最高频 type）。
+
+        Args:
+            dry_run: True=只报告不执行，False=实际合并
+
+        Returns:
+            {"conflicts": N, "merged": N, "details": [...]}
+        """
+        conflicts = await self.get_entity_type_conflicts()
+        if not conflicts:
+            return {"conflicts": 0, "merged": 0, "details": []}
+
+        merged = 0
+        details = []
+        for c in conflicts:
+            # 选出现次数最多的 type
+            best_type = max(c["counts"], key=c["counts"].get)
+            old_types = [t for t in c["types"] if t != best_type]
+            if not old_types:
+                continue
+            if not dry_run:
+                async with self._lock:
+                    # 更新缓存中已加载的实体 type
+                    entity = self._entities.get(c["entity"])
+                    if entity and entity.entity_type != best_type:
+                        entity.entity_type = best_type
+                    # 更新 DB 中所有冲突的 type 行
+                    if self._pool:
+                        conn = await self._pool.acquire()
+                        try:
+                            await conn.execute(
+                                "UPDATE entities SET entity_type = ? WHERE name = ?",
+                                (best_type, c["entity"]),
+                            )
+                            await conn.commit()
+                        finally:
+                            await self._pool.release(conn)
+            merged += 1
+            details.append({
+                "entity": c["entity"],
+                "from_types": old_types,
+                "to_type": best_type,
+            })
+
+        return {
+            "conflicts": len(conflicts),
+            "merged": merged,
+            "dry_run": dry_run,
+            "details": details,
+        }
+
     async def delete_entity(self, name: str) -> None:
         """删除实体及其所有关系（按名称）。
 
@@ -797,14 +893,137 @@ class KnowledgeGraph:
         finally:
             await self._pool.release(conn)
 
+    # ------------------------------------------------------------------
+    # 代码符号索引（v3.4.0：KG 代码符号索引）
+    # 记录函数/类/模块调用关系，从 TencentDB Memory v2.0 的 Code-Graph 资产启发
+    # ------------------------------------------------------------------
+
+    CODE_SYMBOL_TYPES = frozenset({"function", "class", "module", "method", "variable", "api_endpoint"})
+
+    async def add_code_symbol(
+        self, name: str, symbol_type: str, file_path: str,
+        metadata: Optional[dict] = None,
+    ) -> Entity:
+        """添加代码符号实体。
+
+        Args:
+            name: 符号名称（如 "ingest()", "UnifiedMemoryApp", "main.py"）
+            symbol_type: 符号类型（function/class/module/method/variable/api_endpoint）
+            file_path: 源文件路径
+            metadata: 附加元数据（如行号、文档字符串摘要、参数列表等）
+
+        Returns:
+            实体对象
+        """
+        assert symbol_type in self.CODE_SYMBOL_TYPES, f"不支持的符号类型: {symbol_type}"
+        m = metadata or {}
+        m["kind"] = "code_symbol"
+        m["symbol_type"] = symbol_type
+        m["file_path"] = file_path
+        entity = await self.add_entity(name, f"code_{symbol_type}", metadata=m)
+        return entity
+
+    async def add_code_call_relation(
+        self, caller: str, callee: str, weight: float = 1.0,
+    ) -> Relation:
+        """添加代码调用关系（caller → calls → callee）。
+
+        Args:
+            caller: 调用方符号名
+            callee: 被调用方符号名
+            weight: 调用频次权重
+
+        Returns:
+            关系对象
+        """
+        return await self.add_relation_if_absent(caller, "calls", callee, weight=weight, source="code_index")
+
+    async def add_code_contain_relation(
+        self, container: str, contained: str, weight: float = 1.0,
+    ) -> Relation:
+        """添加代码包含关系（container → contains → contained）。
+
+        Args:
+            container: 容器符号名（如模块名、类名）
+            contained: 被包含符号名（如类中的方法、模块中的函数）
+            weight: 包含关系权重
+
+        Returns:
+            关系对象
+        """
+        return await self.add_relation_if_absent(container, "contains", contained, weight=weight, source="code_index")
+
+    async def get_code_symbols_by_file(self, file_path: str) -> list[dict]:
+        """获取某个文件的所有代码符号。
+
+        Args:
+            file_path: 源文件路径
+
+        Returns:
+            [{"name": ..., "type": ..., "metadata": ...}, ...]
+        """
+        # 从所有实体中筛选出 metadata.path == file_path 的代码符号
+        async with self._lock:
+            results = []
+            for name in self._all_entity_names:
+                entity = self._entities.get(name)
+                if entity and entity.metadata.get("kind") == "code_symbol":
+                    if entity.metadata.get("file_path") == file_path:
+                        results.append({
+                            "name": entity.name,
+                            "type": entity.metadata.get("symbol_type", "unknown"),
+                            "metadata": entity.metadata,
+                        })
+            return results
+
+    async def get_code_call_graph(self, symbol_name: str, depth: int = 2) -> dict:
+        """获取代码符号的调用图（调用者和被调用者）。
+
+        Args:
+            symbol_name: 符号名称
+            depth: 递归深度
+
+        Returns:
+            {"symbol": ..., "callers": [...], "callees": [...], "call_graph": {...}}
+        """
+        entity = await self.get_entity(symbol_name)
+        if not entity:
+            return {"symbol": symbol_name, "found": False}
+
+        # 获取所有关系
+        neighbors = await self.get_neighbors(symbol_name)
+        callers = []
+        callees = []
+        for n, r in neighbors:
+            if r == "calls":
+                callees.append({"name": n, "relation": "calls"})
+            # calls 的反向：谁是调用者？需要通过关系索引查找
+        # 从关系列表中反查调用者
+        all_rels = await self.get_relations()
+        for rel in all_rels:
+            if rel.predicate == "calls" and rel.object == symbol_name:
+                callers.append({"name": rel.subject, "relation": "calls"})
+
+        return {
+            "symbol": symbol_name,
+            "found": True,
+            "type": entity.entity_type,
+            "file_path": entity.metadata.get("file_path", ""),
+            "callers": callers,
+            "callees": callees,
+        }
+
     def get_stats(self) -> dict:
         """获取知识图谱统计信息。
 
         v3.1：实体计数从 _all_entity_names 获取（不依赖缓存）。
+        v3.4.0：新增代码符号统计。
 
         Returns:
-            {"entities": N, "relations": N, "entity_types": {...}, "cache_hit_ratio": float}
+            {"entities": N, "relations": N, "entity_types": {...}, "cache_hit_ratio": float,
+             "code_symbols": N, "code_relations": N}
         """
+        # 实体类型统计需要从缓存获取（未缓存的不统计类型）
         # 实体类型统计需要从缓存获取（未缓存的不统计类型）
         type_counts: dict[str, int] = {}
         for entity in self._entities.values():

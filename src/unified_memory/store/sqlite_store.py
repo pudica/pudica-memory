@@ -104,6 +104,16 @@ class SQLitePool:
                 updated_at REAL NOT NULL
             )
         """)
+        # 过期时间列迁移（v3.4.0 新增）
+        cur = await conn.execute("PRAGMA table_info(memories)")
+        existing_cols = {r[1] for r in await cur.fetchall()}
+        if "expires_at" not in existing_cols:
+            logger.info("迁移：为 memories 表补充 expires_at 列")
+            await conn.execute("ALTER TABLE memories ADD COLUMN expires_at REAL")
+        # agent_id 列迁移（v3.4.0 多 agent 隔离）
+        if "agent_id" not in existing_cols:
+            logger.info("迁移：为 memories 表补充 agent_id 列")
+            await conn.execute("ALTER TABLE memories ADD COLUMN agent_id TEXT DEFAULT 'default'")
         # 记忆 FTS5 全文搜索表
         # 迁移：旧版表是 fts5(content, content_rowid=id) 单列结构或非 trigram 分词器，
         # 与代码假设不符（BM25 中文检索依赖 trigram）。检测到旧结构先重建。
@@ -513,6 +523,9 @@ class SQLiteStore:
         self._pool = pool
         self._buffer = buffer
 
+    # 预定义的 wing/room 枚举（v3.4.0：schema 约束）
+    VALID_WINGS = frozenset({"default", "user", "agent", "knowledge", "code", "system", "workflow"})
+
     async def add_memory(self, memory_id: str, content: str, **kwargs: Any) -> None:
         """添加一条记忆记录。
 
@@ -524,12 +537,20 @@ class SQLiteStore:
         import hashlib
         now = time.time()
         content_hash = hashlib.sha256(content.encode()).hexdigest()
+        # wing/room schema 验证（v3.4.0）
+        wing = kwargs.get("wing", "default")
+        if wing not in self.VALID_WINGS:
+            logger.warning("wing='%s' 不在预定义集合中，降级为 'default'", wing)
+            wing = "default"
+        room = kwargs.get("room", "general")
+        if not room or len(room) > 64:
+            room = "general"
         data = {
             "id": memory_id,
             "content": content,
             "content_hash": content_hash,
-            "wing": kwargs.get("wing", "default"),
-            "room": kwargs.get("room", "general"),
+            "wing": wing,
+            "room": room,
             "source": kwargs.get("source", ""),
             "fact_type": kwargs.get("fact_type", "observation"),
             "proof_count": kwargs.get("proof_count", 1),

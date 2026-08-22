@@ -1,6 +1,8 @@
 """tasks/scheduler.py — 任务调度器。
 
 每天凌晨 2 点 reflect，每 4 小时 consolidation。
+v3.4.0 新增：每 24 小时 persona 蒸馏 + 每 6 小时过期清理。
+
 参考 hindsight reflect/agent.py 的 schedule 模式。
 """
 
@@ -21,6 +23,8 @@ class TaskScheduler:
     支持：
     - 每天凌晨 2 点执行 reflect 任务
     - 每 4 小时执行 consolidation 任务
+    - 每 24 小时执行 persona 蒸馏（v3.4.0）
+    - 每 6 小时执行过期记忆清理（v3.4.0）
     - 手动触发
     - 调度统计
     """
@@ -33,6 +37,9 @@ class TaskScheduler:
         consolidate_interval_hours: int = 4,
         compressor: Any = None,
         compress_interval_hours: int = 24,
+        persona_distiller: Any = None,
+        persona_interval_hours: int = 24,
+        clean_expiry_interval_hours: int = 6,
     ):
         """
         Args:
@@ -40,8 +47,11 @@ class TaskScheduler:
             consolidator: Consolidator 实例
             reflect_interval_hours: Reflect 间隔（默认 24 小时）
             consolidate_interval_hours: Consolidation 间隔（默认 4 小时）
-            compressor: Compressor 实例（可选，MemPalace 压缩）
+            compressor: Compressor 实例（可选）
             compress_interval_hours: 压缩任务间隔（默认 24 小时）
+            persona_distiller: PersonaDistiller 实例（v3.4.0）
+            persona_interval_hours: Persona 蒸馏间隔（默认 24 小时）
+            clean_expiry_interval_hours: 过期清理间隔（默认 6 小时）
         """
         self._reflector = reflector
         self._consolidator = consolidator
@@ -49,6 +59,9 @@ class TaskScheduler:
         self._consolidate_interval = consolidate_interval_hours
         self._compressor = compressor
         self._compress_interval = compress_interval_hours
+        self._persona_distiller = persona_distiller
+        self._persona_interval = persona_interval_hours
+        self._clean_expiry_interval = clean_expiry_interval_hours
 
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -57,16 +70,21 @@ class TaskScheduler:
         self.reflect_count = 0
         self.consolidate_count = 0
         self.compress_count = 0
+        self.persona_count = 0
+        self.clean_expiry_count = 0
         self.last_reflect_time: Optional[float] = None
         self.last_consolidate_time: Optional[float] = None
         self.last_compress_time: Optional[float] = None
+        self.last_persona_time: Optional[float] = None
+        self.last_clean_expiry_time: Optional[float] = None
 
     async def start(self) -> None:
         """启动调度器后台循环。"""
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
-        logger.info("调度器已启动 (reflect=%dh, consolidate=%dh)",
-                     self._reflect_interval, self._consolidate_interval)
+        logger.info("调度器已启动 (reflect=%dh, consolidate=%dh, persona=%dh, clean_expiry=%dh)",
+                     self._reflect_interval, self._consolidate_interval,
+                     self._persona_interval, self._clean_expiry_interval)
 
     async def stop(self) -> None:
         """停止调度器。"""
@@ -81,17 +99,20 @@ class TaskScheduler:
 
     async def _run_loop(self) -> None:
         """调度主循环。"""
-        # 计算下次执行时间（统一使用 Asia/Shanghai 本地时区，避免与循环内 now 时区混用）
         shanghai = zoneinfo.ZoneInfo("Asia/Shanghai")
         next_reflect = self._next_reflect_time()
         next_consolidate = datetime.now(shanghai) + timedelta(hours=self._consolidate_interval)
         next_compress = datetime.now(shanghai) + timedelta(hours=self._compress_interval) if self._compressor else None
+        next_persona = datetime.now(shanghai) + timedelta(hours=self._persona_interval) if self._persona_distiller else None
+        next_clean = datetime.now(shanghai) + timedelta(hours=self._clean_expiry_interval)
 
         while self._running:
             now = datetime.now(shanghai)
             should_reflect = now >= next_reflect
             should_consolidate = now >= next_consolidate
             should_compress = self._compressor is not None and next_compress is not None and now >= next_compress
+            should_persona = self._persona_distiller is not None and next_persona is not None and now >= next_persona
+            should_clean = now >= next_clean
 
             if should_reflect:
                 try:
@@ -123,7 +144,26 @@ class TaskScheduler:
                     logger.error("Compression 任务失败: %s", e)
                 next_compress = now + timedelta(hours=self._compress_interval)
 
-            # 休眠 60 秒后再次检查
+            if should_persona:
+                try:
+                    result = await self._persona_distiller.distill()
+                    self.persona_count += 1
+                    self.last_persona_time = now.timestamp()
+                    logger.info("Persona 蒸馏完成: %d 条画像", result.get("personas", 0))
+                except Exception as e:
+                    logger.error("Persona 蒸馏失败: %s", e)
+                next_persona = now + timedelta(hours=self._persona_interval)
+
+            if should_clean:
+                try:
+                    deleted = await self._persona_distiller.clean_expired()
+                    self.clean_expiry_count += 1
+                    self.last_clean_expiry_time = now.timestamp()
+                    logger.info("过期清理完成: 删除 %d 条", deleted)
+                except Exception as e:
+                    logger.error("过期清理失败: %s", e)
+                next_clean = now + timedelta(hours=self._clean_expiry_interval)
+
             await asyncio.sleep(60)
 
     def _next_reflect_time(self) -> datetime:

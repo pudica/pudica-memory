@@ -38,6 +38,7 @@ from unified_memory.search.reranker import Reranker
 from unified_memory.tasks.reflect import Reflector
 from unified_memory.tasks.consolidation import Consolidator
 from unified_memory.tasks.compression import Compressor
+from unified_memory.tasks.persona import PersonaDistiller
 from unified_memory.tasks.scheduler import TaskScheduler
 from unified_memory.middleware.auto_memory import AutoMemoryMiddleware
 
@@ -253,6 +254,17 @@ class UnifiedMemoryApp:
                 "keep_ratio": self.config.compression.keep_ratio,
             },
         ) if self.config.compression.enabled else None
+
+        # Persona 蒸馏器（v3.4.0）
+        persona_distiller = PersonaDistiller(
+            pool=self.pool,
+            chroma=self.chroma,
+            llm=self.llm,
+            kg=self.kg,
+            min_authority="high",
+            min_trust_score=0.7,
+        )
+
         self.scheduler = TaskScheduler(
             reflector=reflector,
             consolidator=consolidator,
@@ -260,10 +272,14 @@ class UnifiedMemoryApp:
             consolidate_interval_hours=4,
             compressor=self.compressor,
             compress_interval_hours=max(1, self.config.compression.interval // 3600) if self.config.compression.enabled else 24,
+            persona_distiller=persona_distiller,
+            persona_interval_hours=24,
+            clean_expiry_interval_hours=6,
         )
         await self.scheduler.start()
         logger.info("  调度器: reflect=24h, consolidate=4h" +
-                     (f", compression={self.config.compression.interval}s" if self.compressor else ""))
+                     (f", compression={self.config.compression.interval}s" if self.compressor else "") +
+                     ", persona=24h, clean_expiry=6h")
 
         elapsed = time.time() - t0
         self._initialized = True
@@ -428,6 +444,41 @@ async def run_test(config: Config):
 # 入口点
 # ---------------------------------------------------------------------------
 
+def create_embedded_app(config_path: Optional[str] = None, agent_id: str = "default") -> "UnifiedMemoryApp":
+    """嵌入式运行模式：创建并启动 UnifiedMemoryApp 实例，免 HTTP 服务。
+
+    v3.4.0 新增：免启动 HTTP/MCP 服务器，直接 import 后调用此函数即可使用。
+
+    Args:
+        config_path: 配置文件路径（默认为 None，使用自动发现）
+        agent_id: 多 agent 隔离标识（默认为 "default"）
+
+    Returns:
+        已初始化并启动的 UnifiedMemoryApp 实例
+
+    Usage:
+        from unified_memory import create_embedded_app
+
+        app = create_embedded_app()
+        # 使用 app.ingest(...) 直接写入
+        # 使用 app.search(...) 直接检索
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    config = Config.load(config_path)
+    config.agent_id = agent_id
+
+    app = UnifiedMemoryApp(config)
+    loop.run_until_complete(app.initialize())
+    # 启动后台调度器
+    start_scheduler = hasattr(app, 'scheduler') and app.scheduler is not None
+    if start_scheduler:
+        loop.create_task(app.scheduler.run())
+    logger.info("嵌入式模式已启动: agent_id=%s, data_dir=%s", agent_id, config.data_dir)
+    return app
+
+
 def _clean_pycache():
     """启动时自动清理 __pycache__ 目录，防止旧 .pyc 缓存导致改代码不生效。"""
     src_dir = os.path.join(os.path.dirname(__file__))
@@ -498,50 +549,34 @@ async def run_mcp(config: Config):
             logger.info("pudica-Memory MCP 服务器启动 (stdio 模式)")
             try:
                 await mcp.run_stdio_async()
-            except KeyboardInterrupt:
-                logger.info("MCP 服务器收到 KeyboardInterrupt，退出")
-                return
             except Exception as e:
-                restart_count += 1
-                logger.error(
-                    "MCP 服务器异常退出 (第 %d 次重启): %s", restart_count, e,
-                    exc_info=True,
-                )
+                logger.error("MCP 服务器崩溃: %s", e)
+        except Exception as e:
+            logger.error("初始化失败: %s", e)
         finally:
             await app.shutdown()
 
-        # 重启前等待，避免死循环快速重启
-        if restart_count > 3:
-            wait = min(30, 5 * (restart_count - 3))
-            logger.info("MCP 服务器 %d 秒后自动重启...", wait)
-            await asyncio.sleep(wait)
-        else:
-            await asyncio.sleep(2)
+        restart_count += 1
+        wait = min(restart_count * 5, 60)
+        logger.info("将在 %d 秒后重启 (累计重启次数: %d)", wait, restart_count)
+        await asyncio.sleep(wait)
 
 
 async def run_http(config: Config, host: str = "127.0.0.1", port: int = 8000):
-    """启动 HTTP 服务器（REST API 模式）。
-
-    Args:
-        host: 监听地址
-        port: 监听端口
-    """
-    from unified_memory.api.http_server import HTTPServer
+    """启动 HTTP 服务器（REST API）。"""
+    from unified_memory.api.http_server import app as fastapi_app
+    import uvicorn
 
     app = UnifiedMemoryApp(config)
     await app.initialize()
-    http_server = HTTPServer(app.registry, middleware=app.middleware)
+    fastapi_app.state.app = app
 
-    logger.info("pudica-Memory HTTP 服务器启动: http://%s:%d", host, port)
-    if app.middleware:
-        logger.info("  自动存取中间件已启用: /api/v1/auto/*")
-    try:
-        await http_server.run_sse(host=host, port=port)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await app.shutdown()
-
-
-if __name__ == "__main__":
-    main()
+    logger.info("HTTP 服务器启动: http://%s:%d", host, port)
+    config_obj = uvicorn.Config(
+        fastapi_app,
+        host=host,
+        port=port,
+        log_level=config.log_level.lower(),
+    )
+    server = uvicorn.Server(config_obj)
+    await server.serve()
