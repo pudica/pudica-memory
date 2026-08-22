@@ -266,16 +266,17 @@ class UnifiedMemoryApp:
         )
 
         self.scheduler = TaskScheduler(
-            reflector=reflector,
-            consolidator=consolidator,
-            reflect_interval_hours=24,
-            consolidate_interval_hours=4,
-            compressor=self.compressor,
-            compress_interval_hours=max(1, self.config.compression.interval // 3600) if self.config.compression.enabled else 24,
-            persona_distiller=persona_distiller,
-            persona_interval_hours=24,
-            clean_expiry_interval_hours=6,
-        )
+                    reflector=reflector,
+                    consolidator=consolidator,
+                    reflect_interval_hours=24,
+                    consolidate_interval_hours=4,
+                    compressor=self.compressor,
+                    compress_interval_hours=max(1, self.config.compression.interval // 3600) if self.config.compression.enabled else 24,
+                    persona_distiller=persona_distiller,
+                    persona_interval_hours=24,
+                    clean_expiry_interval_hours=6,
+                    sqlite_store=self.pool,
+                )
         await self.scheduler.start()
         logger.info("  调度器: reflect=24h, consolidate=4h" +
                      (f", compression={self.config.compression.interval}s" if self.compressor else "") +
