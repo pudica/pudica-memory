@@ -139,12 +139,12 @@ class SQLiteStoreStage:
             )
             for attempt in range(2):
                 try:
-                    conn = await engine._pool.acquire()
+                    conn = await asyncio.wait_for(engine._pool.acquire(), timeout=5.0)
                     try:
                         await conn.execute(
-                                                    "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, authority, trust_score, summary, metadata, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                                    (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, extracted.get("authority", "medium"), extracted.get("trust_score", 0.5), extracted.get("summary", ""), meta_json, msg["timestamp"], msg["timestamp"], md.get("expires_at")),
-                                                )
+                "INSERT OR IGNORE INTO memories (id, content, content_hash, wing, room, source, fact_type, authority, trust_score, summary, metadata, created_at, updated_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (msg["id"], msg["content"], msg.get("content_hash", ""), wing_val, room_val, msg.get("source", ""), fact_type, extracted.get("authority", "medium"), extracted.get("trust_score", 0.5), extracted.get("summary", ""), meta_json, msg["timestamp"], msg["timestamp"], md.get("expires_at")),
+                )
                         await conn.commit()
                         sqlite_ok_ids.add(msg["id"])
                     finally:
@@ -468,54 +468,54 @@ class PipelineEngine:
         return self._running
 
     async def start(self) -> None:
-            """启动 Pipeline 后台循环。"""
-            if not self._stages:
-                self._register_defaults()
-            self._running = True
-            self._flush_task = asyncio.create_task(self._flush_loop())
+        """启动 Pipeline 后台循环。"""
+        if not self._stages:
+            self._register_defaults()
+        self._running = True
+        self._flush_task = asyncio.create_task(self._flush_loop())
 
-            # 从 DB 恢复 ingest_count
-            try:
-                if self._pool:
-                    conn = await self._pool.acquire()
-                    try:
-                        cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
-                        row = await cursor.fetchone()
-                        if row:
-                            self.ingest_count = row["count"]
-                            logger.info("从 DB 恢复 ingest_count=%d", self.ingest_count)
-                    finally:
-                        await self._pool.release(conn)
-            except Exception as e:
-                logger.warning("恢复 ingest_count 失败: %s", e)
+        # 从 DB 恢复 ingest_count
+        try:
+            if self._pool:
+                conn = await self._pool.acquire()
+                try:
+                    cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
+                    row = await cursor.fetchone()
+                    if row:
+                        self.ingest_count = row["count"]
+                        logger.info("从 DB 恢复 ingest_count=%d", self.ingest_count)
+                finally:
+                    await self._pool.release(conn)
+        except Exception as e:
+            logger.warning("恢复 ingest_count 失败: %s", e)
 
-            logger.info(
-                "Pipeline 已启动 (batch_size=%d, flush_interval=%.1fs, idle_timeout=%.1fs)",
-                self._batch_size, self._flush_interval, self._idle_timeout,
-            )
-            logger.info("Pipeline 步骤顺序: %s", " → ".join(self._order))
+        logger.info(
+            "Pipeline 已启动 (batch_size=%d, flush_interval=%.1fs, idle_timeout=%.1fs)",
+            self._batch_size, self._flush_interval, self._idle_timeout,
+        )
+        logger.info("Pipeline 步骤顺序: %s", " → ".join(self._order))
 
-    async def stop(self) -> None:
-        self._running = False
-        if self._idle_timer and not self._idle_timer.done():
-            self._idle_timer.cancel()
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
-            try:
-                await self._flush_task
-            except asyncio.CancelledError:
-                pass
-        if self._buffer:
-            await self._flush_buffer()
-        logger.info("Pipeline 已停止")
+        async def stop(self) -> None:
+            self._running = False
+            if self._idle_timer and not self._idle_timer.done():
+                self._idle_timer.cancel()
+            if self._flush_task and not self._flush_task.done():
+                self._flush_task.cancel()
+                try:
+                    await self._flush_task
+                except asyncio.CancelledError:
+                    pass
+            if self._buffer:
+                await self._flush_buffer()
+            logger.info("Pipeline 已停止")
 
-    async def flush(self) -> None:
-        async with self._lock:
-            await self._flush_buffer()
+        async def flush(self) -> None:
+            async with self._lock:
+                await self._flush_buffer()
 
-    # ============================================================
-    # 数据入口
-    # ============================================================
+            # ============================================================
+            # 数据入口
+            # ============================================================
 
     async def ingest(self, content: str, source: str = "", metadata: Optional[dict] = None) -> str:
         """L0 入口：去重 + 缓冲。

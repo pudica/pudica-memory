@@ -116,12 +116,13 @@ DEFAULT_ENTITY_PATTERNS: list[tuple[str, str]] = [
     (r"[A-Z]{2,}(?:-[A-Z]+)*", "org"),
 ]
 
-# 事实类型关键词（Hindsight 4 类结构化记忆）
+# 事实类型关键词（Hindsight 4 类结构化记忆 + causation）
 FACT_TYPE_KEYWORDS: dict[str, list[str]] = {
     "observation": ["观察", "发现", "看到", "注意到", "感觉", "觉得", "现象", "情况", "状态", "天气", "今天", "外面", "这里", "那里"],
-    "experience": ["经历", "做过", "尝试", "体验", "用过", "试过", "实施", "执行", "完成", "去过", "来过", "去了", "来了", "做了", "吃过"],
-    "world": ["属于", "位于", "包括", "包含", "定义", "指", "代表", "省会", "首都", "号称", "是来自", "名称为", "由构成"],
-    "opinion": ["认为", "建议", "推荐", "应该", "值得", "偏好", "倾向", "不太"],
+    "experience": ["做过", "去过", "吃过", "用过", "看过", "听过", "试过", "去过", "完成了", "做了", "经历了", "参加了", "体验了", "之前", "曾经", "以前"],
+    "world": ["是", "属于", "位于", "定义", "指", "叫做", "就是", "指代", "概念", "方法", "原理", "规则", "标准", "系统", "机制", "结构", "功能", "分类"],
+    "opinion": ["喜欢", "不喜欢", "觉得", "认为", "建议", "想要", "希望", "偏好", "愿意", "倾向", "应该", "最好", "推荐", "更愿意", "推荐", "我建议", "我觉得", "更喜欢", "不太喜欢", "个人认为", "我个人觉得"],
+    "causation": ["因为", "所以", "导致", "造成", "引发", "引起", "使得", "促使", "源于", "起因", "结果", "于是", "因此", "由此", "从而", "以致", "触发", "带来", "产生", "诱发", "由于", "因而", "故此", "以至于", "正因为"],
 }
 
 # 事实类型置信度权重（Hindsight: 带置信度的事实提取）
@@ -130,6 +131,7 @@ FACT_TYPE_CONFIDENCE: dict[str, float] = {
     "observation": 0.7,  # 观察到的事实
     "experience": 0.8,   # 个人经历，较可靠
     "opinion": 0.5,      # 主观意见，置信度较低
+    "causation": 0.6,    # 因果推理，依赖上下文准确性
 }
 
 
@@ -167,7 +169,7 @@ class L1Extractor:
             except Exception as e:
                 logger.warning("LLM 提取失败，降级到本地规则: %s", e)
 
-        return self._local_extract(messages)
+        return await self._local_extract(messages)
 
     async def _llm_extract(self, messages: list[str]) -> dict:
         """LLM 增强提取。"""
@@ -222,7 +224,7 @@ class L1Extractor:
         logger.error("LLM 提取全部失败: %s", last_error)
         raise last_error  # 让上层降级走本地规则
 
-    def _local_extract(self, messages: list[str]) -> dict:
+    async def _local_extract(self, messages: list[str]) -> dict:
         """纯本地规则提取：关键词实体 + 时间戳摘要。
 
         Returns:
@@ -235,7 +237,7 @@ class L1Extractor:
 
         # 2. 实体注册表过滤
         if self._registry is not None:
-            entities = self._filter_entities_by_registry(entities)
+            entities = await self._filter_entities_by_registry(entities)
 
         # 3. 事实类型判断
         fact_type = self._classify_fact_type(combined)
@@ -260,7 +262,7 @@ class L1Extractor:
             "trust_score": self._compute_trust_score(fact_type, len(entities), len(combined)),
         }
 
-    def _filter_entities_by_registry(self, entities: list[dict]) -> list[dict]:
+    async def _filter_entities_by_registry(self, entities: list[dict]) -> list[dict]:
         """根据实体注册表白名单过滤实体列表。
 
         只有注册表中 state='confirmed' 的实体才保留。
@@ -278,18 +280,18 @@ class L1Extractor:
             # 先检查 GARBAGE_ENTITIES 黑名单
             if name in GARBAGE_ENTITIES:
                 continue
-            state = self._registry.get_state(name)
+            state = self._registry.get_state_sync(name)
             if state == "confirmed":
                 filtered.append(ent)
             elif state == "rejected":
                 continue  # 明确拒绝的实体不写入 KG
             else:
-                # 未知 / candidate 实体：让注册表自动发现，但不写入 KG
-                # 但保留在返回列表中（只是不太可能被后续写入 KG）
-                # 这里标记将要注册为 candidate
-                self._registry.auto_discover(name, ent.get("type", "unknown"))
-                # 未知实体暂不写入 KG，但保留在 SQLite 中
-                # 所以仍然返回，engine 会决定是否写入 KG
+                # 未知 / candidate 实体：注册到注册表以递增计数
+                # 异步注册，不阻塞过滤流程
+                try:
+                    await self._registry.register(name, ent.get("entity_type", "org"))
+                except Exception:
+                    pass  # 注册失败不影响过滤
                 filtered.append(ent)
         return filtered
 
@@ -300,11 +302,18 @@ class L1Extractor:
         英文人名/缩写规则误判为 person/org。现在对纯英文候选做停用词过滤，
         只在确属专有名词（首字母多词组、或大缩写）时才保留。
 
+        P1 增强: 每个实体附加 signal-based confidence 评分（0.3-0.99），
+        基于对话模式、动词上下文、出现次数等信号。
+
         Returns:
-            [{"name": "...", "type": "person|org|location|product"}, ...]
+            [{"name": "...", "type": "person|org|location|product",
+              "confidence": "0.0-1.0", "signals": [...]}, ...]
         """
         seen: set[str] = set()
         entities: list[dict] = []
+        # 收集每个候选名的出现次数（用于频率信号）
+        name_counts: dict[str, int] = {}
+        text_lower = text.lower()
 
         for pattern, ent_type in DEFAULT_ENTITY_PATTERNS:
             for match in re.finditer(pattern, text):
@@ -323,12 +332,130 @@ class L1Extractor:
                 name = self._clean_entity_name(name, ent_type)
                 if len(name) < 2:
                     continue
-                if name not in seen:
-                    seen.add(name)
+                name_lower = name.lower()
+                if name_lower not in seen:
+                    seen.add(name_lower)
+                    name_counts[name_lower] = 1
                     entities.append({"name": name, "type": ent_type})
+                else:
+                    name_counts[name_lower] += 1
+
+        # P1: 信号评分 — 给每个实体算 confidence 和 signals
+        for ent in entities:
+            score = self._score_entity(ent["name"], ent["type"], text, text_lower, name_counts.get(ent["name"].lower(), 1))
+            ent["confidence"] = score["confidence"]
+            ent["signals"] = score["signals"]
 
         # 去重后取前 20 个
         return entities[:20]
+
+    @staticmethod
+    def _score_entity(name: str, ent_type: str, text: str, text_lower: str, frequency: int) -> dict:
+        """对单个实体做信号评分，返回 confidence 和 signals。
+
+        移植自 MemPalace score_entity/classify_entity 的核心思想（信号评分制），
+        但适配中文场景：用对话标记、动词上下文、出现频率等信号。
+
+        Args:
+            name: 实体名
+            ent_type: 实体类型（person/org/location/product）
+            text: 原始文本
+            text_lower: 小写文本（预计算）
+            frequency: 实体在文本中出现次数
+
+        Returns:
+            {"confidence": 0.0-0.99, "signals": [...]}
+        """
+        signals = []
+        score = 0.0
+        name_lower = name.lower()
+
+        # 信号1: 频率 — 出现次数越多越可信
+        if frequency >= 3:
+            score += 0.15
+            signals.append(f"高频({frequency}x)")
+        elif frequency >= 2:
+            score += 0.08
+            signals.append(f"中频({frequency}x)")
+
+        # 信号2: 对话标记 — 实体名后跟冒号/说/问等
+        # 检查 ":name" 或 "name:" 或 "name说" 等模式
+        if ent_type == "person":
+            name_in_text = name in text
+            if name_in_text:
+                # 对话标记：name: 或 name：或 name说
+                dialogue_patterns = [
+                    name + ":", name + "：", name + "说",
+                    name + "问", name + "答", name + "表示",
+                    name + "认为", name + "指出", name + "回答",
+                    name + "解释", name + "告诉", name + "写道",
+                    name + "想", name + "觉得", name + "知道",
+                    name + "喜欢", name + "确认", name + "提醒",
+                    name + "分享", name + "建议", name + "同意",
+                    name + "反对", name + "决定", name + "提出",
+                ]
+                if any(p in text for p in dialogue_patterns):
+                    score += 0.2
+                    signals.append("对话标记")
+                # 动词上下文：name + 做的/用了/完成了 等
+                action_patterns = [
+                    name + "做了", name + "用了", name + "完成了",
+                    name + "参加了", name + "去过", name + "用过",
+                    name + "吃过", name + "看过", name + "听过",
+                    name + "负责", name + "管理", name + "处理",
+                    name + "开发", name + "设计", name + "编写",
+                    name + "创建", name + "修改", name + "修复",
+                    name + "测试", name + "部署", name + "发布",
+                ]
+                if any(p in text for p in action_patterns):
+                    score += 0.15
+                    signals.append("动作上下文")
+                # 代词邻近：实体名附近 3 行内有他/她/它
+                name_idx = text.find(name)
+                if name_idx >= 0:
+                    window_start = max(0, text.rfind("\n", 0, name_idx) - 50)
+                    window_end = min(len(text), text.find("\n", name_idx) + 50)
+                    window = text[window_start:window_end]
+                    pronouns = ["他", "她", "它", "他们", "她们", "它们", "他", "她", "其"]
+                    if any(p in window for p in pronouns):
+                        score += 0.1
+                        signals.append("代词邻近")
+
+        # 信号3: 实体类型基分
+        type_base = {"person": 0.2, "org": 0.15, "location": 0.15, "product": 0.1}
+        base = type_base.get(ent_type, 0.1)
+        score += base
+        # 首次出现时不加 type 信号描述，避免信号过多
+
+        # 信号4: 中文人名 — 姓氏+名字结构本身可信
+        if ent_type == "person" and any(name.startswith(s) for s in _CHINESE_SURNAMES):
+            score += 0.1
+            signals.append("中文姓氏")
+
+        # 信号5: 英文名 — 首字母大写的多词短语
+        if ent_type == "person" and " " in name and name[0].isupper():
+            score += 0.1
+            signals.append("英文全名")
+
+        # 信号6: 全大写缩写 — 组织名
+        if ent_type == "org" and name.isupper() and len(name) >= 2:
+            score += 0.1
+            signals.append("大写缩写")
+
+        # 信号7: 头衔后缀 — 老师/主任/局长等
+        title_suffixes = ["医生", "大夫", "老师", "先生", "女士", "同志", "经理", "主任", "教授", "院长", "局长"]
+        if any(name.endswith(s) for s in title_suffixes):
+            score += 0.15
+            signals.append("头衔后缀")
+
+        # 截断并归一化到 0.3-0.99
+        confidence = max(0.3, min(0.99, score))
+        confidence = round(confidence, 2)
+
+        return {
+            "confidence": confidence,
+            "signals": signals[:5],  # 最多保留 5 个信号
+        }
 
     _ENGLISH_GENERIC_WORDS = frozenset({
         "error", "window", "windows", "install", "installer", "dll", "utf", "utf8",
@@ -481,12 +608,12 @@ class L1Extractor:
                                  "我平时", "我觉得", "我最近", "我每天", "我主要", "我一直", "我一般", "我经常", "我负责",
                                  "我养", "我有", "我需要", "我想", "我打算", "我在用", "我用", "我吃", "我去", "我来"]
         for p in first_person_patterns:
-            if p in text[:200]:
+            if p in text:
                 return "critical"
 
         experience_verbs = ["我做过", "我用过", "我吃过", "我去过", "我试过", "我用了", "我做了", "我完成了"]
         for v in experience_verbs:
-            if v in text[:300]:
+            if v in text:
                 return "critical"
 
         if fact_type == "world" and entity_count >= 1:
@@ -538,6 +665,7 @@ def _build_llm_prompt(messages: list[str]) -> str:
    - "experience": 个人经历/做过的事
    - "world": 世界知识/客观事实
    - "opinion": 主观观点/偏好/建议
+   - "causation": 因果关系/原因结果
 6. confidence: 提取结果的置信度 (0.0-1.0)，基于信息明确程度
 
 输出格式：

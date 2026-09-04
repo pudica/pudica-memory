@@ -34,8 +34,11 @@ class TemporalRetriever:
     ) -> list[ScoredResult]:
         """时间检索：时间范围过滤 + 时间衰减加权。
 
+        query 非空时，结合 FTS5 做关键词过滤（内容匹配）+ 时间排序。
+        query 为空时，仅按时间排序（兜底最近内容）。
+
         Args:
-            query: 查询文本（当前未使用，保留接口兼容性）
+            query: 查询文本（非空时做 FTS5 内容过滤）
             top_k: 返回条数
             decay_rate: 衰减率，默认 0.1
             time_range: 可选，时间范围过滤 (start_ts, end_ts)
@@ -52,14 +55,27 @@ class TemporalRetriever:
         now = time.time()
         conn = await self._pool.acquire()
         try:
-            sql = """
-                SELECT id, content, created_at, metadata
-                FROM memories
-                WHERE created_at BETWEEN ? AND ?
-                ORDER BY created_at DESC
-                LIMIT ?
-            """
-            cursor = await conn.execute(sql, (time_range[0], time_range[1], top_k * 2))
+            # query 非空时，结合 FTS5 做内容过滤 + 时间排序
+            if query.strip():
+                sql = """
+                    SELECT m.id, m.content, m.created_at, m.metadata
+                    FROM memories m
+                    JOIN memories_fts fts ON fts.rowid = m.id
+                    WHERE memories_fts MATCH ?
+                      AND m.created_at BETWEEN ? AND ?
+                    ORDER BY rank, m.created_at DESC
+                    LIMIT ?
+                """
+                cursor = await conn.execute(sql, (query, time_range[0], time_range[1], top_k * 2))
+            else:
+                sql = """
+                    SELECT id, content, created_at, metadata
+                    FROM memories
+                    WHERE created_at BETWEEN ? AND ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """
+                cursor = await conn.execute(sql, (time_range[0], time_range[1], top_k * 2))
             rows = await cursor.fetchall()
 
             scored: list[ScoredResult] = []

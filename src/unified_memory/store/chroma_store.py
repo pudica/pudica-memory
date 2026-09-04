@@ -155,7 +155,7 @@ def get_chroma_executor() -> concurrent.futures.ThreadPoolExecutor:
     with _CHROMA_EXECUTOR_LOCK:
         if _CHROMA_EXECUTOR is None:
             _CHROMA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="chroma_worker",
+                max_workers=8, thread_name_prefix="chroma_worker",
             )
         return _CHROMA_EXECUTOR
 
@@ -193,21 +193,31 @@ class ChromaStore:
             os.makedirs(self._persist_dir, exist_ok=True)
             self._client = chromadb.PersistentClient(path=self._persist_dir)
 
-    def _add_safe(self, documents, ids, metadatas) -> None:
-        """幂等地写入文档。
+    def _add_safe(self, documents, ids, metadatas) -> bool:
+        """幂等地写入文档，返回是否成功。
 
         内存去重缓存 `_seen_hashes` 进程重启即丢失，重启后再次写入相同内容会
         产生相同的 doc_id，ChromaDB 会抛 "ID already exists"。这里捕获该异常并
         降级为 upsert，保证写入幂等、不再崩溃。
+
+        Returns:
+            True 写入成功，False 写入失败（调用方决定是否回滚）
         """
         try:
             self._collection.add(documents=documents, ids=ids, metadatas=metadatas)
-        except Exception as e:  # 兼容不同版本：DuplicateIDError / ValueError("ID already exists")
+            return True
+        except Exception as e:
             if "already exists" in str(e) or "DuplicateID" in str(e):
                 logger.debug("ChromaDB 文档 ID 已存在，降级为 upsert: %s", e)
-                self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+                try:
+                    self._collection.upsert(documents=documents, ids=ids, metadatas=metadatas)
+                    return True
+                except Exception as ue:
+                    logger.error("ChromaDB upsert 也失败: %s", ue)
+                    return False
             else:
-                raise
+                logger.error("ChromaDB add 失败: %s", e)
+                return False
 
     def _distance_to_score(self, distance: float) -> float:
         """余弦距离（ChromaDB 返回，范围 [0, 2]）转相似度分数。
@@ -360,7 +370,8 @@ class ChromaStore:
             return []
 
         with self._batch_lock:
-            self._add_safe(documents=documents, ids=ids, metadatas=metadatas)
+            if not self._add_safe(documents=documents, ids=ids, metadatas=metadatas):
+                raise RuntimeError(f"ChromaDB 批量写入失败 ({len(documents)} 条)")
         logger.debug("批量写入 %d 条到 ChromaDB", len(documents))
         return result_ids
 

@@ -111,8 +111,8 @@ class Reflector:
         self._pool = pool
         self._mental_models = mental_models
         self._settings = settings or {}
-        self._max_retries = self._settings.get("max_retries", 3)
         self._extract_window = self._settings.get("extract_window", 3600 * 24 * 7)
+        self._max_context_chars = self._settings.get("max_context_chars", 4000)
 
     async def reflect(self) -> dict:
         """执行一次完整的 Reflect 流程。
@@ -205,7 +205,7 @@ class Reflector:
         finally:
             await self._pool.release(conn)
 
-        return "\n".join(parts)
+        return "\n".join(parts)[:self._max_context_chars]
 
     async def _call_llm(self, context: str) -> dict:
         """单次 LLM 调用。"""

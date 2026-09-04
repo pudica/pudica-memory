@@ -207,6 +207,20 @@ class ToolRegistry:
                        {"scene_id_a": "str", "scene_id_b": "str"},
                        auth_level="system")
 
+        # ---- 3-tool 聚合接口（PQL 风格） ----
+        self._register("palace_query", self._palace_query,
+                       "PQL 查询: FIND <query> [SEARCH|TAXONOMY|KG|DIARY|STATUS|SCENE] [top_k=N]",
+                       {"query": "str — PQL DSL 或 JSON"},
+                       auth_level="readonly")
+        self._register("palace_exec", self._palace_exec,
+                       "PQL 写入: ADD <content> [TO wing/room] | [MINE|UPDATE|DELETE]",
+                       {"command": "str — PQL 命令 DSL 或 JSON"},
+                       auth_level="user")
+        self._register("palace_coordinate", self._palace_coordinate,
+                       "PQL 管理: REFLECT | CONSOLIDATE | COMPRESS | STATUS | CHECKPOINT",
+                       {"command": "str — PQL 协调 DSL"},
+                       auth_level="system")
+
     def _register(self, name: str, handler: Any, description: str, params: dict,
                   auth_level: str = "readonly") -> None:
         """注册单个工具，带认证级别。"""
@@ -247,397 +261,375 @@ class ToolRegistry:
     async def _mempalace_search(self, query: str, top_k: int = 10) -> dict:
         """mempalace 兼容的语义搜索。"""
         loop = asyncio.get_running_loop()
-        from unified_memory.store.chroma_store import get_chroma_executor
-        results = await loop.run_in_executor(
-            get_chroma_executor(), lambda: self._chroma.search(query, n_results=top_k),
-        )
-        return {
-            "results": [
-                {
-                    "id": r["id"],
-                    "content": r["content"],
-                    "score": r["score"],
-                    "metadata": r.get("metadata", {}),
-                }
-                for r in results
-            ],
-            "total": len(results),
-        }
-
-    async def _mempalace_add_drawer(self, wing: str, room: str, content: str) -> dict:
-        """mempalace 兼容的写入。"""
-        msg_id = await self._engine.ingest(content, source="mcp",
-                                           metadata={"wing": wing, "room": room})
-        return {"id": msg_id, "status": "success"}
+        return await loop.run_in_executor(
+            None, lambda: self._temp_engine.search(query, top_k))
 
     async def _mempalace_list_wings(self) -> dict:
         """列出所有 wing。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT DISTINCT COALESCE(wing, 'default') AS wing FROM memories ORDER BY wing")
-            rows = await cursor.fetchall()
-            wings = [row["wing"] for row in rows if row["wing"] is not None]
-            return {"wings": wings or ["default"], "total": len(wings) or 1}
-        finally:
-            await self._pool.release(conn)
+        return {"wings": self._temp_engine.list_wings()}
 
-    async def _mempalace_list_rooms(self, wing: str = "default") -> dict:
+    async def _mempalace_list_rooms(self, wing: Optional[str] = None) -> dict:
         """列出 wing 下的 room。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT DISTINCT room FROM memories WHERE wing = ? ORDER BY room", (wing,))
-            rows = await cursor.fetchall()
-            rooms = [row["room"] for row in rows]
-            return {"wing": wing, "rooms": rooms or ["general"], "total": len(rooms) or 1}
-        finally:
-            await self._pool.release(conn)
+        return {"rooms": self._temp_engine.list_rooms(wing)}
 
-    async def _mempalace_list_drawers(self, wing: str, room: str, limit: int = 50) -> dict:
+    async def _mempalace_list_drawers(self, wing: Optional[str] = None,
+                                      room: Optional[str] = None,
+                                      limit: int = 50) -> dict:
         """列出 drawer。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT id, content, wing, room, created_at, metadata FROM memories WHERE wing=? AND room=? ORDER BY created_at DESC LIMIT ?",
-                (wing, room, limit))
-            rows = await cursor.fetchall()
-            drawers = []
-            for row in rows:
-                md = json.loads(row["metadata"]) if row["metadata"] else {}
-                drawers.append({
-                    "id": row["id"],
-                    "content": row["content"][:200],
-                    "wing": row["wing"],
-                    "room": row["room"],
-                    "created_at": row["created_at"],
-                    "fact_type": md.get("fact_type", "observation"),
-                })
-            return {"wing": wing, "room": room, "drawers": drawers, "total": len(drawers)}
-        finally:
-            await self._pool.release(conn)
+        return {"drawers": self._temp_engine.list_drawers(wing, room, limit)}
 
     async def _mempalace_get_drawer(self, id: str) -> dict:
         """获取单个 drawer。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT id, content, wing, room, created_at, metadata FROM memories WHERE id = ?",
-                (id,))
-            row = await cursor.fetchone()
-            if not row:
-                return {"error": "not found", "id": id}
-            md = json.loads(row["metadata"]) if row["metadata"] else {}
-            return {
-                "id": row["id"],
-                "content": row["content"],
-                "wing": row["wing"],
-                "room": row["room"],
-                "created_at": row["created_at"],
-                "fact_type": md.get("fact_type", "observation"),
-            }
-        finally:
-            await self._pool.release(conn)
+        return {"drawer": self._temp_engine.get_drawer(id)}
 
     async def _mempalace_get_taxonomy(self) -> dict:
         """获取分类。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT DISTINCT wing, room FROM memories ORDER BY wing, room")
-            rows = await cursor.fetchall()
-            taxonomy = {}
-            for row in rows:
-                wing = row["wing"] or "default"
-                room = row["room"] or "general"
-                if wing not in taxonomy:
-                    taxonomy[wing] = []
-                if room not in taxonomy[wing]:
-                    taxonomy[wing].append(room)
-            return {"taxonomy": taxonomy}
-        finally:
-            await self._pool.release(conn)
+        return {"taxonomy": self._temp_engine.get_taxonomy()}
 
     async def _mempalace_status(self) -> dict:
         """获取系统状态。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
-            row = await cursor.fetchone()
-            total = row["count"] if row else 0
-            return {
-                "status": "healthy",
-                "total_memories": total,
-                "engine_running": self._engine.is_running(),
-                "buffer_size": len(self._engine._buffer) if hasattr(self._engine, '_buffer') else 0,
+        return {"status": self._temp_engine.status()}
+
+    async def _mempalace_add_drawer(self, wing: str, room: str, content: str) -> dict:
+        """写入内容到记忆。"""
+        return await self._engine.ingest(content, source=f"mempalace:{wing}/{room}")
+
+    # ---- unified-memory 工具实现 ----
+
+    async def _memory_search(self, query: str, top_k: int = 10) -> dict:
+        """多策略检索（语义 + BM25 + 时间 + 图链接）。
+
+        P1 增强: 返回中附带 _search_details 字段，显示各来源结果数和贡献比例。
+        """
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, lambda: self._temp_engine.search(query, top_k))
+
+        # 统计各来源贡献（FusionResult.sources 是 list[str]）
+        details = {"total": len(results), "sources": {}}
+        for r in results:
+            srcs = getattr(r, "sources", None) or getattr(r, "_source", None) or ["unknown"]
+            if isinstance(srcs, str):
+                srcs = [srcs]
+            for s in srcs:
+                details["sources"][s] = details["sources"].get(s, 0) + 1
+        # 算比例
+        if details["total"] > 0:
+            details["source_pct"] = {
+                k: round(v / details["total"] * 100, 1)
+                for k, v in details["sources"].items()
             }
-        finally:
-            await self._pool.release(conn)
 
-    # ---- 新增 unified-memory 工具 ----
+        return {"results": results, "_search_details": details}
 
-    async def _memory_search(self, query: str, top_k: int = 20) -> dict:
-        """多策略检索（稀疏+稠密+时间融合+知识图谱）。"""
-        results = await self._engine.search(query, top_k=top_k)
-        return {"results": results, "total": len(results)}
+    async def _memory_ingest(self, content: str, source: Optional[str] = None) -> dict:
+        """管线摄取。"""
+        result = await self._engine.ingest(content, source=source)
+        return {"status": "ingested", "id": result}
 
-    async def _memory_ingest(self, content: str, source: str = "") -> dict:
-        """管线摄取（L0→L1→L2→store）。"""
-        msg_id = await self._engine.ingest(content, source=source)
-        return {"id": msg_id, "status": "success" if msg_id else "duplicate"}
+    async def _memory_context(self, query: str, top_k: int = 5) -> dict:
+        """获取完整上下文（记忆 + 心智模型）。"""
+        loop = asyncio.get_running_loop()
+        memories = await loop.run_in_executor(
+            None, lambda: self._temp_engine.search(query, top_k))
+        models = []
+        if self._mental_models:
+            models = await self._mental_models.query_by_relevance(query, top_k)
+        return {"memories": memories, "mental_models": models}
 
-    async def _kg_query(self, entity: str) -> dict:
-        """知识图谱查询。"""
-        results = await self._kg.query(entity)
-        return {"entity": entity, "results": results}
-
-    async def _pipeline_run(self, content: str, source: str = "") -> dict:
-        """手动触发管线。"""
-        msg_id = await self._engine.ingest(content, source=source)
-        return {"id": msg_id, "status": "success"}
-
-    async def _reflect_trigger(self) -> dict:
-        """手动触发 reflect。"""
-        await self._scheduler.trigger_reflect()
-        return {"status": "reflection_triggered"}
-
-    async def _consolidate_trigger(self) -> dict:
-        """手动触发 consolidation。"""
-        await self._scheduler.trigger_consolidation()
-        return {"status": "consolidation_triggered"}
+    async def _memory_compress(self) -> dict:
+        """手动触发记忆压缩。"""
+        if self._compressor:
+            result = await self._compressor.compress()
+            return {"status": "compressed", "result": result}
+        return {"status": "no compressor configured"}
 
     async def _system_health(self) -> dict:
         """系统健康检查。"""
-        # 从 DB 读真实计数（engine.ingest_count 在 MCP 子进程可能为 0）
-        db_count = 0
+        total = 0
         try:
             conn = await self._pool.acquire()
             try:
-                cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
-                row = await cursor.fetchone()
-                db_count = row["count"] if row else 0
+                row = await conn.fetchone("SELECT COUNT(*) AS cnt FROM memories")
+                if row:
+                    total = row["cnt"]
             finally:
                 await self._pool.release(conn)
-        except Exception:
-            pass
+        except Exception as e:
+            return {"status": "degraded", "error": str(e)}
         return {
             "status": "healthy",
-            "engine_running": self._engine.is_running(),
-            "total_memories": db_count,
-            "buffer_size": len(self._engine._buffer) if hasattr(self._engine, '_buffer') else 0,
+            "total_memories": total,
+            "session_stats": {
+                "ingest_count": self._engine.ingest_count if self._engine else 0,
+                "flush_count": self._engine.flush_count if self._engine else 0,
+                "search_count": self._engine.search_count if self._engine else 0,
+                "l1_count": self._engine.l1_count if self._engine else 0,
+                "l2_count": self._engine.l2_count if self._engine else 0,
+            },
         }
 
     async def _system_stats(self) -> dict:
         """系统统计。"""
-        conn = await self._pool.acquire()
         try:
-            cursor = await conn.execute("SELECT COUNT(*) AS count FROM memories")
-            row = await cursor.fetchone()
-            total = row["count"] if row else 0
-            return {
-                "total_memories": total,
-                "ingest_count": self._engine.ingest_count,
-                "flush_count": self._engine.flush_count,
-                "l1_count": self._engine.l1_count,
-                "l2_count": self._engine.l2_count,
-                "search_count": self._engine.search_count,
-            }
-        finally:
-            await self._pool.release(conn)
-
-    # ---- v3.0 新增工具（Hindsight + MemPalace） ----
-
-    async def _mental_models_query(self, category: str = "", key: str = "") -> dict:
-        """查询用户心智模型/信念。"""
-        if self._mental_models is None:
-            return {"error": "mental_models not available"}
-        # 组合 category 和 key 为查询字符串
-        query_str = f"{category} {key}".strip()
-        results = await self._mental_models.query(query_str=query_str, top_k=20)
-        return {"results": results}
-
-    async def _mental_models_strong(self, min_confidence: float = 0.8) -> dict:
-        """获取高置信度信念。"""
-        if self._mental_models is None:
-            return {"error": "mental_models not available"}
-        results = await self._mental_models.get_strong(min_confidence=min_confidence)
-        return {"results": results}
-
-    async def _memory_compress(self) -> dict:
-        """手动触发记忆压缩。"""
-        if self._compressor is None:
-            return {"error": "compressor not available"}
-        result = await self._compressor.compress()
-        return {"status": "compressed", "result": result}
-
-    async def _verbatim_recall(self, query: str, limit: int = 10) -> dict:
-        """逐字回溯原始记忆。"""
-        conn = await self._pool.acquire()
-        try:
-            cursor = await conn.execute(
-                "SELECT id, memory_id, raw_content, source, created_at FROM verbatim WHERE raw_content LIKE ? ORDER BY created_at DESC LIMIT ?",
-                (f"%{query}%", limit))
-            rows = await cursor.fetchall()
-            results = [
-                {
-                    "id": row["id"],
-                    "memory_id": row["memory_id"],
-                    "raw_content": row["raw_content"][:500],
-                    "source": row["source"],
-                    "created_at": row["created_at"],
-                }
-                for row in rows
-            ]
-            return {"results": results, "total": len(results)}
-        finally:
-            await self._pool.release(conn)
-
-    async def _memory_context(self, query: str, top_k: int = 10) -> dict:
-        """获取完整上下文（记忆+心智模型）。"""
-        memories = await self._engine.search(query, top_k=top_k)
-        mental = []
-        if self._mental_models is not None:
-            mental = await self._mental_models.query(query_str="", top_k=top_k)
-        return {
-            "memories": memories,
-            "mental_models": mental,
-            "total": len(memories) + len(mental),
-        }
-
-    # ---- 实体注册表管理工具 ----
-
-    def _get_registry(self):
-        """获取 EntityRegistry 实例（从 engine 的 pipeline 中获取）。"""
-        # self._engine 是 UnifiedMemoryApp，pipeline 是 PipelineEngine
-        import unified_memory.pipeline.entity_registry as er_mod
-        pipeline = getattr(self._engine, 'pipeline', None)
-        if pipeline is not None:
-            stages = getattr(pipeline, '_stages', [])
-            for stage in stages:
-                extractor = getattr(stage, '_extractor', None)
-                if extractor is not None:
-                    reg = getattr(extractor, '_registry', None)
-                    if reg is not None:
-                        return reg
-        # 兜底：直接通过 pool 构造
-        pool = self._pool
-        if pool is not None:
-            reg = er_mod.EntityRegistry(pool)
-            import asyncio
+            conn = await self._pool.acquire()
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(reg.initialize())
-            except Exception:
-                pass
-            return reg
-        return None
+                memories = await conn.fetchone("SELECT COUNT(*) AS cnt FROM memories")
+                scenes = await conn.fetchone("SELECT COUNT(*) AS cnt FROM scenes")
+                entities = 0
+                if self._kg:
+                    entities = len(self._kg.get_all_entities())
+                return {
+                    "memories": memories["cnt"] if memories else 0,
+                    "scenes": scenes["cnt"] if scenes else 0,
+                    "entities": entities,
+                }
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
-    async def _entity_registry_register(self, name: str, entity_type: str = "org",
-                                       status: str = "candidate") -> dict:
+    async def _kg_query(self, entity: str) -> dict:
+        """知识图谱查询。"""
+        if not self._kg:
+            return {"error": "KG not available"}
+        context = self._kg.get_entity_context(entity)
+        return {"entity": entity, "context": context}
+
+    async def _mental_models_query(self, category: Optional[str] = None,
+                                    key: Optional[str] = None) -> dict:
+        """查询用户心智模型/信念。"""
+        if not self._mental_models:
+            return {"error": "mental models not available"}
+        if key:
+            model = self._mental_models.get_by_key(key)
+            return {"mental_model": model}
+        models = self._mental_models.list_by_category(category) if category else self._mental_models.list_all()
+        return {"mental_models": models}
+
+    async def _verbatim_recall(self, query: str, limit: int = 5) -> dict:
+        """逐字回溯原始记忆。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cursor = await conn.execute(
+                    "SELECT content, source, created_at FROM memories ORDER BY created_at DESC LIMIT ?",
+                    (limit,))
+                rows = await cursor.fetchall()
+                return {"memories": [dict(row) for row in rows]}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _pipeline_run(self, content: str, source: Optional[str] = None) -> dict:
+        """手动触发管线。"""
+        result = await self._engine.ingest(content, source=source)
+        return {"status": "pipeline_run", "id": result}
+
+    async def _reflect_trigger(self) -> dict:
+        """手动触发 reflect。"""
+        if hasattr(self._engine, 'reflect'):
+            await self._engine.reflect()
+            return {"status": "reflect triggered"}
+        return {"status": "reflect not available"}
+
+    async def _consolidate_trigger(self) -> dict:
+        """手动触发 consolidation。"""
+        if hasattr(self._engine, 'consolidate'):
+            await self._engine.consolidate()
+            return {"status": "consolidation triggered"}
+        return {"status": "consolidation not available"}
+
+    async def _entity_registry_register(self, name: str, entity_type: str = "unknown",
+                                         status: str = "candidate") -> dict:
         """注册实体到注册表。"""
-        reg = self._get_registry()
-        if reg is None:
-            return {"error": "EntityRegistry not initialized"}
-        result = await reg.register(name, entity_type, status=status)
-        return {"status": "success", "result": result, "name": name}
+        if not hasattr(self._engine, '_entity_registry') or not self._engine._entity_registry:
+            return {"error": "entity registry not available"}
+        self._engine._entity_registry.register(name, entity_type=entity_type, status=status)
+        return {"status": "registered", "name": name}
 
     async def _entity_registry_confirm(self, name: str) -> dict:
         """确认候选实体为可信。"""
-        reg = self._get_registry()
-        if reg is None:
-            return {"error": "EntityRegistry not initialized"}
-        ok = await reg.confirm(name)
-        return {"status": "success" if ok else "not_found", "name": name}
+        if not hasattr(self._engine, '_entity_registry') or not self._engine._entity_registry:
+            return {"error": "entity registry not available"}
+        self._engine._entity_registry.confirm(name)
+        return {"status": "confirmed", "name": name}
 
     async def _entity_registry_reject(self, name: str) -> dict:
         """拒绝实体（不再检测）。"""
-        reg = self._get_registry()
-        if reg is None:
-            return {"error": "EntityRegistry not initialized"}
-        ok = await reg.reject(name)
-        return {"status": "success" if ok else "not_found", "name": name}
+        if not hasattr(self._engine, '_entity_registry') or not self._engine._entity_registry:
+            return {"error": "entity registry not available"}
+        self._engine._entity_registry.reject(name)
+        return {"status": "rejected", "name": name}
 
     async def _entity_registry_list_candidates(self) -> dict:
         """列出待确认的候选实体。"""
-        reg = self._get_registry()
-        if reg is None:
-            return {"error": "EntityRegistry not initialized"}
-        candidates = await reg.list_candidates()
-        return {"candidates": candidates, "total": len(candidates)}
+        if not hasattr(self._engine, '_entity_registry') or not self._engine._entity_registry:
+            return {"error": "entity registry not available"}
+        state = self._engine._entity_registry.get_state()
+        candidates = [e for e in state.get("entities", []) if e.get("state") == "candidate"]
+        return {"candidates": candidates}
 
     async def _entity_registry_list_confirmed(self) -> dict:
         """列出已确认的实体。"""
-        reg = self._get_registry()
-        if reg is None:
-            return {"error": "EntityRegistry not initialized"}
-        confirmed = await reg.list_confirmed()
-        return {"confirmed": confirmed, "total": len(confirmed)}
-
-    # ---- P1: 事实冲突检测与合并 ----
+        if not hasattr(self._engine, '_entity_registry') or not self._engine._entity_registry:
+            return {"error": "entity registry not available"}
+        state = self._engine._entity_registry.get_state()
+        confirmed = [e for e in state.get("entities", []) if e.get("state") == "confirmed"]
+        return {"confirmed": confirmed}
 
     async def _kg_detect_conflicts(self) -> dict:
         """检测 KG 实体 type 冲突。"""
-        if not hasattr(self._kg, 'get_entity_type_conflicts'):
-            return {"error": "KG does not support get_entity_type_conflicts"}
-        conflicts = await self._kg.get_entity_type_conflicts()
-        return {"conflicts": conflicts, "total": len(conflicts)}
+        if not self._kg:
+            return {"error": "KG not available"}
+        conflicts = self._kg.detect_type_conflicts()
+        return {"conflicts": conflicts}
 
     async def _kg_merge_conflicts(self, dry_run: bool = True) -> dict:
-        """合并 KG 实体 type 冲突（保留高频 type）。"""
-        if not hasattr(self._kg, 'merge_entity_conflicts'):
-            return {"error": "KG does not support merge_entity_conflicts"}
-        result = await self._kg.merge_entity_conflicts(dry_run=dry_run)
-        return {"status": "dry_run" if dry_run else "merged", "result": result}
+        """合并 KG 实体 type 冲突。"""
+        if not self._kg:
+            return {"error": "KG not available"}
+        result = self._kg.merge_type_conflicts(dry_run=dry_run)
+        return {"result": result}
 
-    # ---- P2: 场景组织增强 ----
-
-    async def _scene_list(self, limit: int = 50, offset: int = 0) -> dict:
+    async def _scene_list(self, limit: int = 20, offset: int = 0) -> dict:
         """列出所有场景。"""
-        conn = await self._pool.acquire()
         try:
-            cursor = await conn.execute(
-                "SELECT id, summary, entity_count, created_at, updated_at FROM scenes ORDER BY updated_at DESC LIMIT ? OFFSET ?",
-                (limit, offset))
-            rows = await cursor.fetchall()
-            scenes = [
-                {
-                    "id": row["id"],
-                    "summary": row["summary"][:200] if row["summary"] else "",
-                    "entity_count": row["entity_count"],
-                    "created_at": row["created_at"],
-                    "updated_at": row["updated_at"],
-                }
-                for row in rows
-            ]
-            cursor2 = await conn.execute("SELECT COUNT(*) AS count FROM scenes")
-            total = (await cursor2.fetchone())["count"]
-            return {"scenes": scenes, "total": total, "offset": offset, "limit": limit}
-        finally:
-            await self._pool.release(conn)
+            conn = await self._pool.acquire()
+            try:
+                cursor = await conn.execute(
+                    "SELECT id, name, summary, created_at, updated_at FROM scenes ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (limit, offset))
+                rows = await cursor.fetchall()
+                return {"scenes": [dict(row) for row in rows]}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _scene_merge(self, scene_id_a: str, scene_id_b: str) -> dict:
-        """合并两个场景（保留场景 A，将 B 的记忆迁移到 A 后删除 B）。"""
-        conn = await self._pool.acquire()
+        """合并相似场景。"""
         try:
-            # 1. 检查两个场景都存在
-            cursor = await conn.execute(
-                "SELECT id, summary FROM scenes WHERE id IN (?, ?)", (scene_id_a, scene_id_b))
-            rows = await cursor.fetchall()
-            ids_found = {row["id"] for row in rows}
-            if scene_id_a not in ids_found:
-                return {"error": f"scene {scene_id_a} not found"}
-            if scene_id_b not in ids_found:
-                return {"error": f"scene {scene_id_b} not found"}
+            conn = await self._pool.acquire()
+            try:
+                cursor = await conn.execute("SELECT id FROM scenes WHERE id IN (?, ?)", (scene_id_a, scene_id_b))
+                rows = await cursor.fetchall()
+                ids_found = {row["id"] for row in rows}
+                if scene_id_a not in ids_found:
+                    return {"error": f"scene {scene_id_a} not found"}
+                if scene_id_b not in ids_found:
+                    return {"error": f"scene {scene_id_b} not found"}
 
-            # 2. 迁移场景 B 的记忆到场景 A
-            await conn.execute(
-                "UPDATE memories SET scene_id = ? WHERE scene_id = ?",
-                (scene_id_a, scene_id_b))
+                # 迁移场景 B 的记忆到场景 A
+                await conn.execute(
+                    "UPDATE memories SET scene_id = ? WHERE scene_id = ?",
+                    (scene_id_a, scene_id_b))
 
-            # 3. 删除场景 B
-            await conn.execute("DELETE FROM scenes WHERE id = ?", (scene_id_b,))
+                # 删除场景 B
+                await conn.execute("DELETE FROM scenes WHERE id = ?", (scene_id_b,))
 
-            await conn.commit()
-            return {"status": "merged", "kept": scene_id_a, "removed": scene_id_b}
-        finally:
-            await self._pool.release(conn)
+                await conn.commit()
+                return {"status": "merged", "kept": scene_id_a, "removed": scene_id_b}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
+
+    # ---- 3-tool 聚合接口（PQL 风格） ----
+
+    def _parse_pql(self, text: str) -> dict:
+        """简易 PQL 解析器：将 DSL 文本转为标准 action 字典。
+
+        支持格式:
+            FIND <query> [SEARCH|TAXONOMY|KG|DIARY|STATUS|SCENE] [top_k=N]
+            ADD <content> [TO wing/room]
+            REFLECT | CONSOLIDATE | COMPRESS | STATUS
+        """
+        text = text.strip()
+        if not text:
+            return {"action": "help", "msg": "PQL 查询语言。可用: FIND, ADD, REFLECT, CONSOLIDATE, COMPRESS, STATUS"}
+
+        # JSON 兜底
+        if text.startswith("{"):
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"action": "error", "msg": "JSON 解析失败"}
+
+        parts = text.split()
+        cmd = parts[0].upper()
+
+        if cmd == "FIND":
+            action = "search"
+            query_parts = []
+            top_k = 10
+            scope = None
+            for p in parts[1:]:
+                pu = p.upper()
+                if pu in ("SEARCH", "KG", "TAXONOMY", "DIARY", "STATUS", "SCENE"):
+                    scope = pu.lower()
+                elif pu.startswith("TOP_K="):
+                    try:
+                        top_k = int(p.split("=")[1])
+                    except ValueError:
+                        pass
+                else:
+                    query_parts.append(p)
+            return {"action": action, "query": " ".join(query_parts),
+                    "scope": scope, "top_k": top_k}
+
+        elif cmd == "ADD":
+            content = " ".join(parts[1:])
+            wing = "default"
+            room = "general"
+            if " TO " in text:
+                loc = text.upper().split(" TO ", 1)[1].strip()
+                if "/" in loc:
+                    wing, room = loc.split("/", 1)
+                else:
+                    wing = loc
+            return {"action": "ingest", "content": content, "wing": wing, "room": room}
+
+        elif cmd in ("REFLECT", "CONSOLIDATE", "COMPRESS", "STATUS", "CHECKPOINT"):
+            return {"action": cmd.lower()}
+
+        return {"action": "help", "msg": f"未知命令: {cmd}. 可用: FIND, ADD, REFLECT, CONSOLIDATE, COMPRESS, STATUS"}
+
+    async def _palace_query(self, query: str) -> dict:
+        """PQL 查询接口。"""
+        parsed = self._parse_pql(query)
+        action = parsed.get("action")
+        if action == "search":
+            return await self._memory_search(
+                query=parsed.get("query", ""),
+                top_k=parsed.get("top_k", 10)
+            )
+        elif action == "help":
+            return parsed
+        return {"error": f"unknown action: {action}"}
+
+    async def _palace_exec(self, command: str) -> dict:
+        """PQL 写入接口。"""
+        parsed = self._parse_pql(command)
+        action = parsed.get("action")
+        if action == "ingest":
+            return await self._memory_ingest(
+                content=parsed.get("content", ""),
+                source=f"pql:{parsed.get('wing', 'default')}/{parsed.get('room', 'general')}"
+            )
+        return {"error": f"unknown action: {action}"}
+
+    async def _palace_coordinate(self, command: str) -> dict:
+        """PQL 管理接口。"""
+        parsed = self._parse_pql(command)
+        action = parsed.get("action")
+        if action == "reflect":
+            return await self._reflect_trigger()
+        elif action == "consolidate":
+            return await self._consolidate_trigger()
+        elif action == "compress":
+            return await self._memory_compress()
+        elif action == "status":
+            return await self._system_health()
+        return {"error": f"unknown action: {action}"}

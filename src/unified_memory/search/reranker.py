@@ -1,9 +1,10 @@
 """search/reranker.py — Cross-Encoder 重排器（Hindsight 启发）。
 
 在 RRF 融合后对 top-N 结果进行二次打分重排，提升检索精度。
-支持两种策略：
+支持三种策略：
   - "heuristic": 基于 TF-IDF 关键词加权、来源多样性、时间新鲜度的启发式打分
   - "llm": 使用 LLM 对 query-doc pair 进行相关性打分（精度更高但更慢）
+  - "cross-encoder": 使用预训练 cross-encoder 模型进行语义相关性打分（精度最高）
 
 参考 Hindsight 的 cross-encoder reranking 流程：
   1. RRF 融合产出候选集
@@ -44,20 +45,26 @@ class Reranker:
         final_k: int = 10,
         llm: Any = None,
         max_concurrent: int = 4,
+        cross_encoder_model: Optional[str] = None,
     ):
         """
         Args:
-            strategy: 重排策略 — "heuristic" 或 "llm"
+            strategy: 重排策略 — "heuristic", "llm" 或 "cross-encoder"
             top_n: 从 RRF 结果中取 top_n 条进行重排
             final_k: 重排后返回的最终条数
             llm: LLM 客户端（strategy="llm" 时必需）
             max_concurrent: LLM 重排时的最大并发数
+            cross_encoder_model: cross-encoder 模型名称或路径（strategy="cross-encoder" 时必需）
         """
         self._strategy = strategy
         self._top_n = top_n
         self._final_k = final_k
         self._llm = llm
         self._sem = asyncio.Semaphore(max_concurrent)
+        self._cross_encoder = None
+        self._cross_encoder_tokenizer = None
+        if strategy == "cross-encoder":
+            self._load_cross_encoder(cross_encoder_model)
 
     async def rerank(
         self,
@@ -81,6 +88,8 @@ class Reranker:
 
         if self._strategy == "llm" and self._llm is not None:
             scored = await self._llm_rerank(query, candidates)
+        elif self._strategy == "cross-encoder" and self._cross_encoder is not None:
+            scored = self._cross_encoder_rerank(query, candidates)
         else:
             scored = self._heuristic_rerank(query, candidates)
 
@@ -257,6 +266,71 @@ class Reranker:
             return self._heuristic_rerank(query, candidates)
 
         return scored
+
+    # ------------------------------------------------------------------
+    # Cross-Encoder 重排
+    # ------------------------------------------------------------------
+
+    def _load_cross_encoder(self, model_name_or_path: Optional[str]) -> None:
+        """加载 cross-encoder 模型。
+
+        Args:
+            model_name_or_path: 模型名称或路径。默认使用本地缓存的
+                cross-encoder/ms-marco-MiniLM-L-6-v2
+        """
+        if not model_name_or_path:
+            model_name_or_path = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+        try:
+            from transformers import AutoTokenizer, AutoModelForSequenceClassification
+            self._cross_encoder_tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path, local_files_only=True
+            )
+            self._cross_encoder = AutoModelForSequenceClassification.from_pretrained(
+                model_name_or_path, local_files_only=True
+            )
+            self._cross_encoder.eval()
+            logger.info(
+                "Cross-encoder 模型加载成功: %s", model_name_or_path
+            )
+        except Exception as e:
+            logger.warning(
+                "Cross-encoder 模型加载失败，回退到启发式重排: %s", e
+            )
+            self._strategy = "heuristic"
+
+    def _cross_encoder_rerank(
+        self,
+        query: str,
+        candidates: list[FusionResult],
+    ) -> list[tuple[FusionResult, float]]:
+        """Cross-Encoder 重排：用预训练模型对 query-doc pair 打分。
+
+        Args:
+            query: 查询文本
+            candidates: 候选结果列表
+
+        Returns:
+            [(FusionResult, new_score), ...]
+        """
+        import torch
+
+        # 批量构建 query-doc pairs
+        pairs = [(query, r.text[:512]) for r in candidates]
+        inputs = self._cross_encoder_tokenizer(
+            pairs,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+            max_length=512,
+        )
+        with torch.no_grad():
+            outputs = self._cross_encoder(**inputs)
+            scores = torch.sigmoid(outputs.logits).squeeze(-1).tolist()
+
+        if not isinstance(scores, list):
+            scores = [scores]
+
+        return [(r, s) for r, s in zip(candidates, scores)]
 
     # ------------------------------------------------------------------
     # 工具方法

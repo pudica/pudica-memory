@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import time
+from functools import lru_cache
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -361,6 +362,7 @@ class Consolidator:
         # 原 char-set Jaccard 对 "云南" vs "南云" 错误地给出 1.0。
         def _bigrams(s: str):
             return {s[i:i+2] for i in range(len(s) - 1)} or {s}  # 单字 fallback
+        _bigrams = lru_cache(maxsize=2048)(_bigrams)
         set_a = _bigrams(a)
         set_b = _bigrams(b)
         intersection = set_a & set_b

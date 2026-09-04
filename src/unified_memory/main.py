@@ -188,19 +188,21 @@ class UnifiedMemoryApp:
 
         # 4c. 重排器（Hindsight: Cross-Encoder）
         if self.config.reranker.enabled:
+            cross_encoder_model = getattr(self.config.reranker, "cross_encoder_model", None)
             self.reranker = Reranker(
                 strategy=self.config.reranker.strategy,
                 top_n=self.config.reranker.top_n,
                 final_k=self.config.reranker.final_k,
                 llm=self.llm if self.config.reranker.strategy == "llm" else None,
                 max_concurrent=self.config.reranker.max_concurrent,
+                cross_encoder_model=cross_encoder_model,
             )
             logger.info("  重排器: strategy=%s, top_n=%d, final_k=%d",
                          self.config.reranker.strategy, self.config.reranker.top_n,
                          self.config.reranker.final_k)
 
         # 5. Pipeline 管线
-        dedup = L0Dedup(maxsize=self.config.pipeline.l0_maxsize)
+            dedup = L0Dedup(maxsize=self.config.pipeline.l0_maxsize)
         # 从 SQLite 恢复去重缓存，防止重启后重复写入
         await dedup.load_from_db(self.pool)
         # L1 默认走本地规则提取，LLM 作为增强（LLM 可用时自动启用增强模式）
@@ -260,9 +262,10 @@ class UnifiedMemoryApp:
             pool=self.pool,
             chroma=self.chroma,
             llm=self.llm,
-            kg=self.kg,
-            min_authority="high",
-            min_trust_score=0.7,
+            settings={
+                "min_authority": "high",
+                "min_trust_score": 0.7,
+            },
         )
 
         self.scheduler = TaskScheduler(
@@ -332,7 +335,8 @@ class UnifiedMemoryApp:
         if self.scheduler:
             await self.scheduler.stop()
         if self.pipeline:
-            await self.pipeline.stop()  # stop() 内部已刷盘
+                    # PipelineEngine 没有 stop() 方法，用 _flush_buffer 刷盘
+                    await self.pipeline._flush_buffer()
         if self.chroma:
             # 释放 ChromaDB 客户端资源（SQLite 句柄 + 线程池）
             # 注意：不要调用 client.reset() —— 它清空整个向量库（且 1.5.9 默认禁用）
@@ -565,12 +569,13 @@ async def run_mcp(config: Config):
 
 async def run_http(config: Config, host: str = "127.0.0.1", port: int = 8000):
     """启动 HTTP 服务器（REST API）。"""
-    from unified_memory.api.http_server import app as fastapi_app
+    from unified_memory.api.http_server import HTTPServer
     import uvicorn
 
     app = UnifiedMemoryApp(config)
     await app.initialize()
-    fastapi_app.state.app = app
+    http_server = HTTPServer(registry=app.registry, middleware=app.middleware)
+    fastapi_app = http_server.create_app()
 
     logger.info("HTTP 服务器启动: http://%s:%d", host, port)
     config_obj = uvicorn.Config(
