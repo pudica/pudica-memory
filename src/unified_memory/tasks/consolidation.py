@@ -370,23 +370,66 @@ class Consolidator:
         return len(intersection) / len(union) if union else 0.0
 
     async def _log_consolidation(self, result: dict) -> None:
-        """记录 consolidation 结果到日志表。"""
-        conn = await self._pool.acquire()
-        try:
-            # 自动建表（如果不存在）
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS consolidation_logs (
-                    id TEXT PRIMARY KEY,
-                    result TEXT,
-                    created_at REAL
+            """记录 consolidation 结果到日志表 + 证据链表。
+
+            v3.5.0 增强：每条 evidence 独立写入 evidence_chain 表，
+            支持按类型/实体/时间查询，可追溯。
+            """
+            conn = await self._pool.acquire()
+            try:
+                # consolidation_logs（保留完整 JSON 日志）
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS consolidation_logs (
+                        id TEXT PRIMARY KEY,
+                        result TEXT,
+                        created_at REAL
+                    )
+                """)
+                run_id = str(uuid4())
+                await conn.execute(
+                    "INSERT INTO consolidation_logs (id, result, created_at) VALUES (?, ?, ?)",
+                    (run_id, json.dumps(result, ensure_ascii=False), time.time()),
                 )
-            """)
-            await conn.execute(
-                "INSERT INTO consolidation_logs (id, result, created_at) VALUES (?, ?, ?)",
-                (str(uuid4()), json.dumps(result, ensure_ascii=False), time.time()),
-            )
-            await conn.commit()
-        except Exception as e:
-            logger.warning("写入 consolidation 日志失败: %s", e)
-        finally:
-            await self._pool.release(conn)
+
+                # evidence_chain（独立可查询）
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS evidence_chain (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id TEXT,
+                        strategy TEXT NOT NULL,
+                        entity_a TEXT,
+                        entity_b TEXT,
+                        similarity REAL,
+                        reason TEXT,
+                        provenance TEXT,
+                        created_at REAL NOT NULL
+                    )
+                """)
+
+                now = time.time()
+                for strategy_name in ("dedup", "merge", "link", "upgrade"):
+                    strat_result = result.get(strategy_name, {})
+                    for ev in strat_result.get("evidence", []):
+                        try:
+                            await conn.execute(
+                                """INSERT INTO evidence_chain
+                                   (run_id, strategy, entity_a, entity_b, similarity, reason, provenance, created_at)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                (
+                                    run_id,
+                                    ev.get("type", strategy_name),
+                                    ev.get("entity_a") or ev.get("from") or ev.get("subject") or ev.get("entity", ""),
+                                    ev.get("entity_b") or ev.get("into") or ev.get("object", ""),
+                                    ev.get("similarity", 0.0),
+                                    ev.get("reason", ""),
+                                    json.dumps(ev.get("provenance", {}), ensure_ascii=False),
+                                    now,
+                                ),
+                            )
+                        except Exception as e2:
+                            logger.debug("写入单条 evidence 失败: %s", e2)
+                await conn.commit()
+            except Exception as e:
+                logger.warning("写入 consolidation 日志/证据链失败: %s", e)
+            finally:
+                await self._pool.release(conn)

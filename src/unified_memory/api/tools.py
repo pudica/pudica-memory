@@ -178,6 +178,22 @@ class ToolRegistry:
                        "列出已确认的实体", {},
                        auth_level="user")
 
+        # ---- L3 Persona 工具（v3.5.0 新增：画像蒸馏 MCP 暴露） ----
+        self._register("get_persona", self._get_persona,
+                       "获取用户画像（按主题或全部）",
+                       {"topic": "str (optional)", "min_confidence": "str (optional, low/medium/high)"},
+                       auth_level="readonly")
+        self._register("persona_trigger", self._persona_trigger,
+                       "手动触发 Persona 蒸馏",
+                       {"force": "bool (optional, default=false)"},
+                       auth_level="system")
+
+        # ---- 场景导航树（v3.5.0 新增：树状场景索引） ----
+        self._register("scene_tree", self._scene_tree,
+                       "场景导航树（按 wing → room → 时间分组）",
+                       {"wing": "str (optional)", "limit": "int (optional)"},
+                       auth_level="readonly")
+
         # ---- system 级别（需要管理员 API key） ----
         self._register("pipeline_run", self._pipeline_run,
                        "手动触发管线", {"content": "str", "source": "str (optional)"},
@@ -260,9 +276,7 @@ class ToolRegistry:
 
     async def _mempalace_search(self, query: str, top_k: int = 10) -> dict:
         """mempalace 兼容的语义搜索。"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
-            None, lambda: self._temp_engine.search(query, top_k))
+        return await self._temp_engine.search(query, top_k)
 
     async def _mempalace_list_wings(self) -> dict:
         """列出所有 wing。"""
@@ -301,9 +315,7 @@ class ToolRegistry:
 
         P1 增强: 返回中附带 _search_details 字段，显示各来源结果数和贡献比例。
         """
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(
-            None, lambda: self._temp_engine.search(query, top_k))
+        results = await self._temp_engine.search(query, top_k)
 
         # 统计各来源贡献（FusionResult.sources 是 list[str]）
         details = {"total": len(results), "sources": {}}
@@ -320,7 +332,17 @@ class ToolRegistry:
                 for k, v in details["sources"].items()
             }
 
-        return {"results": results, "_search_details": details}
+        from dataclasses import asdict
+        serialized = []
+        for r in results:
+            try:
+                entry = asdict(r)
+                if isinstance(entry.get("metadata"), dict):
+                    entry["metadata"] = {str(k): str(v) for k, v in entry["metadata"].items()}
+                serialized.append(entry)
+            except Exception:
+                serialized.append({"id": str(getattr(r, "id", "")), "text": str(getattr(r, "text", ""))})
+        return {"results": serialized, "_search_details": details}
 
     async def _memory_ingest(self, content: str, source: Optional[str] = None) -> dict:
         """管线摄取。"""
@@ -328,14 +350,36 @@ class ToolRegistry:
         return {"status": "ingested", "id": result}
 
     async def _memory_context(self, query: str, top_k: int = 5) -> dict:
-        """获取完整上下文（记忆 + 心智模型）。"""
-        loop = asyncio.get_running_loop()
-        memories = await loop.run_in_executor(
-            None, lambda: self._temp_engine.search(query, top_k))
-        models = []
-        if self._mental_models:
-            models = await self._mental_models.query_by_relevance(query, top_k)
-        return {"memories": memories, "mental_models": models}
+            """获取完整上下文（记忆 + 心智模型 + 画像）。
+
+            v3.5.0 增强：注入 persona 画像和场景导航，使 agent 在对话时拥有
+            更完整的用户认知上下文（类似 TencentDB memory-prompt/composer.ts 的注入模式）。
+            """
+            memories = await self._temp_engine.search(query, top_k)
+            models = []
+            if self._mental_models:
+                models = await self._mental_models.query_by_relevance(query, top_k)
+
+            # Persona 注入（v3.5.0）：获取用户画像作为上下文
+            persona_prompt = ""
+            try:
+                persona_text = await self._get_persona_inline(min_confidence="medium")
+                if persona_text:
+                    persona_prompt = f"\n\n[用户画像]\n{persona_text}"
+            except Exception as e:
+                logger.warning("Persona 注入失败: %s", e)
+
+            # 场景导航注入（v3.5.0）：获取场景导航树作为上下文
+            scene_tree_text = ""
+            try:
+                scene_tree_data = await self._build_scene_tree()
+                if scene_tree_data:
+                    scene_tree_text = f"\n\n[场景导航]\n{scene_tree_data}"
+            except Exception as e:
+                logger.warning("场景导航注入失败: %s", e)
+
+            return {"memories": memories, "mental_models": models,
+                    "persona": persona_prompt.strip(), "scene_tree": scene_tree_text.strip()}
 
     async def _memory_compress(self) -> dict:
         """手动触发记忆压缩。"""
@@ -350,7 +394,8 @@ class ToolRegistry:
         try:
             conn = await self._pool.acquire()
             try:
-                row = await conn.fetchone("SELECT COUNT(*) AS cnt FROM memories")
+                cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM memories")
+                row = await cursor.fetchone()
                 if row:
                     total = row["cnt"]
             finally:
@@ -374,11 +419,13 @@ class ToolRegistry:
         try:
             conn = await self._pool.acquire()
             try:
-                memories = await conn.fetchone("SELECT COUNT(*) AS cnt FROM memories")
-                scenes = await conn.fetchone("SELECT COUNT(*) AS cnt FROM scenes")
+                memories_cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM memories")
+                memories = await memories_cursor.fetchone()
+                scenes_cursor = await conn.execute("SELECT COUNT(*) AS cnt FROM scenes")
+                scenes = await scenes_cursor.fetchone()
                 entities = 0
                 if self._kg:
-                    entities = len(self._kg.get_all_entities())
+                    entities = len(await self._kg.get_all_entities())
                 return {
                     "memories": memories["cnt"] if memories else 0,
                     "scenes": scenes["cnt"] if scenes else 0,
@@ -393,7 +440,7 @@ class ToolRegistry:
         """知识图谱查询。"""
         if not self._kg:
             return {"error": "KG not available"}
-        context = self._kg.get_entity_context(entity)
+        context = await self._kg.get_entity_context(entity)
         return {"entity": entity, "context": context}
 
     async def _mental_models_query(self, category: Optional[str] = None,
@@ -483,14 +530,14 @@ class ToolRegistry:
         """检测 KG 实体 type 冲突。"""
         if not self._kg:
             return {"error": "KG not available"}
-        conflicts = self._kg.detect_type_conflicts()
+        conflicts = await self._kg.detect_type_conflicts()
         return {"conflicts": conflicts}
 
     async def _kg_merge_conflicts(self, dry_run: bool = True) -> dict:
         """合并 KG 实体 type 冲突。"""
         if not self._kg:
             return {"error": "KG not available"}
-        result = self._kg.merge_type_conflicts(dry_run=dry_run)
+        result = await self._kg.merge_type_conflicts(dry_run=dry_run)
         return {"result": result}
 
     async def _scene_list(self, limit: int = 20, offset: int = 0) -> dict:
@@ -633,3 +680,145 @@ class ToolRegistry:
         elif action == "status":
             return await self._system_health()
         return {"error": f"unknown action: {action}"}
+
+    # ------------------------------------------------------------------
+    # L3 Persona 工具（v3.5.0 新增）
+    # ------------------------------------------------------------------
+
+    async def _get_persona(self, topic: Optional[str] = None,
+                            min_confidence: str = "low") -> dict:
+        """获取用户画像（通过 scheduler 中的 persona_distiller 查询）。"""
+        if not self._scheduler or not hasattr(self._scheduler, "_persona_distiller"):
+            return {"error": "persona distiller not available"}
+        distiller = self._scheduler._persona_distiller
+        if not distiller:
+            return {"error": "persona distiller not configured"}
+        try:
+            personas = await distiller.get_personas(
+                topic=topic, min_confidence=min_confidence
+            )
+            return {"personas": personas, "count": len(personas)}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _persona_trigger(self, force: bool = False) -> dict:
+        """手动触发 Persona 蒸馏。"""
+        if not self._scheduler or not hasattr(self._scheduler, "_persona_distiller"):
+            return {"error": "persona distiller not available"}
+        distiller = self._scheduler._persona_distiller
+        if not distiller:
+            return {"error": "persona distiller not configured"}
+        try:
+            result = await distiller.distill(force=force)
+            return {"status": "distilled", "result": result}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _get_persona_inline(self, min_confidence: str = "medium") -> str:
+        """获取格式化的 persona 文本（供 memory_context 注入使用）。"""
+        if not self._scheduler or not hasattr(self._scheduler, "_persona_distiller"):
+            return ""
+        distiller = self._scheduler._persona_distiller
+        if not distiller:
+            return ""
+        try:
+            personas = await distiller.get_personas(min_confidence=min_confidence)
+            if not personas:
+                return ""
+            out = []
+            for p in personas[:10]:
+                conf = p.get("confidence", "low")
+                icon = {"high": "✅", "medium": "📌", "low": "ℹ️"}.get(conf, "ℹ️")
+                summary = p.get("summary", "")
+                key_facts = p.get("key_facts", [])
+                line = f"{icon} [{p['topic']}] {summary}"
+                if key_facts:
+                    facts_text = " | ".join(kf[:40] for kf in key_facts[:3])
+                    line += f"\n   -> 关键: {facts_text}"
+                out.append(line)
+            return "\n".join(out)
+        except Exception as e:
+            logger.warning("获取 inline persona 失败: %s", e)
+            return ""
+
+    # ------------------------------------------------------------------
+    # 场景导航树（v3.5.0 新增）
+    # ------------------------------------------------------------------
+
+    async def _scene_tree(self, wing: Optional[str] = None, limit: int = 50) -> dict:
+        """场景导航树（按 wing -> room -> 时间分组）。"""
+        try:
+            tree_text = await self._build_scene_tree(wing=wing, limit=limit)
+            return {"scene_tree": tree_text, "tree_type": "text"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _build_scene_tree(self, wing: Optional[str] = None,
+                                 limit: int = 50) -> str:
+        """构建场景导航树文本。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                if wing:
+                    cursor = await conn.execute(
+                        """SELECT s.id, s.name, s.summary, s.wing, s.room,
+                                  s.created_at, s.updated_at,
+                                  COUNT(m.id) AS memory_count
+                           FROM scenes s
+                           LEFT JOIN memories m ON m.scene_id = s.id
+                           WHERE s.wing = ?
+                           GROUP BY s.id
+                           ORDER BY s.wing, s.room, s.created_at DESC
+                           LIMIT ?""",
+                        (wing, limit),
+                    )
+                else:
+                    cursor = await conn.execute(
+                        """SELECT s.id, s.name, s.summary, s.wing, s.room,
+                                  s.created_at, s.updated_at,
+                                  COUNT(m.id) AS memory_count
+                           FROM scenes s
+                           LEFT JOIN memories m ON m.scene_id = s.id
+                           GROUP BY s.id
+                           ORDER BY s.wing, s.room, s.created_at DESC
+                           LIMIT ?""",
+                        (limit,),
+                    )
+                rows = await cursor.fetchall()
+                if not rows:
+                    return "（暂无场景数据）"
+
+                tree: dict[str, dict[str, list[dict]]] = {}
+                for row in rows:
+                    w = row["wing"] or "default"
+                    r = row["room"] or "general"
+                    if w not in tree:
+                        tree[w] = {}
+                    if r not in tree[w]:
+                        tree[w][r] = []
+                    tree[w][r].append({
+                        "id": row["id"],
+                        "name": row["name"],
+                        "summary": (row["summary"] or "")[:80],
+                        "created_at": row["created_at"],
+                        "memory_count": row["memory_count"],
+                    })
+
+                out = []
+                for w in sorted(tree.keys()):
+                    out.append(f"\n├─ 🏠 {w}")
+                    for r in sorted(tree[w].keys()):
+                        scenes = tree[w][r]
+                        out.append(f"│  ├─ 📁 {r} ({len(scenes)} 个场景)")
+                        for s in scenes[:10]:
+                            mem_label = f'{s["memory_count"]}条记忆' if s["memory_count"] else "0条"
+                            out.append(f"│  │  ├─ 📄 {s['name']} [{mem_label}]")
+                            if s.get("summary"):
+                                out.append(f"│  │  │   {s['summary'][:60]}")
+                return "\n".join(out)
+
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            logger.warning("构建场景树失败: %s", e)
+            return "（场景树构建失败）"

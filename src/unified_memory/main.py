@@ -335,8 +335,8 @@ class UnifiedMemoryApp:
         if self.scheduler:
             await self.scheduler.stop()
         if self.pipeline:
-                    # PipelineEngine 没有 stop() 方法，用 _flush_buffer 刷盘
-                    await self.pipeline._flush_buffer()
+            # PipelineEngine 没有 stop() 方法，用 _flush_buffer 刷盘
+            await self.pipeline._flush_buffer()
         if self.chroma:
             # 释放 ChromaDB 客户端资源（SQLite 句柄 + 线程池）
             # 注意：不要调用 client.reset() —— 它清空整个向量库（且 1.5.9 默认禁用）
@@ -541,30 +541,21 @@ def main():
 
 
 async def run_mcp(config: Config):
-    """启动 MCP 服务器（stdio 模式），自动重启。"""
+    """启动 MCP 服务器（stdio 模式）。单次运行，不内建重启——重启由 Gateway 的 auto_restart 管理。"""
     from unified_memory.api.mcp_server import create_mcp_server
 
-    restart_count = 0
-    while True:
-        app = UnifiedMemoryApp(config)
-        try:
-            await app.initialize()
-            mcp = create_mcp_server(app)
+    app = UnifiedMemoryApp(config)
+    await app.initialize()
+    mcp = create_mcp_server(app)
 
-            logger.info("pudica-Memory MCP 服务器启动 (stdio 模式)")
-            try:
-                await mcp.run_stdio_async()
-            except Exception as e:
-                logger.error("MCP 服务器崩溃: %s", e)
-        except Exception as e:
-            logger.error("初始化失败: %s", e)
-        finally:
-            await app.shutdown()
-
-        restart_count += 1
-        wait = min(restart_count * 5, 60)
-        logger.info("将在 %d 秒后重启 (累计重启次数: %d)", wait, restart_count)
-        await asyncio.sleep(wait)
+    logger.info("pudica-Memory MCP 服务器启动 (stdio 模式)")
+    try:
+        await mcp.run_stdio_async()
+    except Exception as e:
+        logger.error("MCP 服务器崩溃: %s", e)
+        raise
+    finally:
+        await app.shutdown()
 
 
 async def run_http(config: Config, host: str = "127.0.0.1", port: int = 8000):

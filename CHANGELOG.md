@@ -1,6 +1,16 @@
 # Changelog
 
-## v3.2.0 (2026-08-04)
+v3.4.2
+
+### MCP 服务器修复
+- mcp_server.py 重写：用 `_make_tool_handler` 包装 bound method，修复 KeyError 崩溃
+- 新工具全部暴露：get_persona、persona_trigger、scene_tree
+- 修复 `_memory_context` 嵌套缩进错误（从 _memory_compress 解耦）
+
+### 工具修复
+- tools.py：_system_health 和 _system_stats 改用 cursor.fetchone()，修复 fetchone bug
+- tools.py：_system_stats 补上 KG 实体查询
+- 新增 MCP 工具：get_persona / persona_trigger / scene_tree
 
 ### 自动存取中间件（AutoMemoryMiddleware）
 
