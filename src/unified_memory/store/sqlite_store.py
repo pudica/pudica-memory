@@ -346,6 +346,29 @@ class SQLitePool:
             self._in_use.clear()
             self._initialized = False
 
+    async def get_config(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """读取 config 表（key-value 存储）。不存在返回 default。"""
+        conn = await self.acquire()
+        try:
+            cursor = await conn.execute("SELECT value FROM config WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            return row[0] if row else default
+        finally:
+            await self.release(conn)
+
+    async def set_config(self, key: str, value: str) -> None:
+        """写入 config 表（UPSERT）。value 非空字符串。"""
+        conn = await self.acquire()
+        try:
+            await conn.execute(
+                """INSERT INTO config (key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (key, value),
+            )
+            await conn.commit()
+        finally:
+            await self.release(conn)
+
 
 # ---------------------------------------------------------------------------
 # 写入缓冲队列

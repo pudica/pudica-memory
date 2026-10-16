@@ -143,6 +143,7 @@ class Config:
     chroma: ChromaConfig = field(default_factory=ChromaConfig)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
     reranker: RerankerConfig = field(default_factory=RerankerConfig)
+    embedder_id_mismatch: str = "warn"  # embedder 身份校验不匹配时的动作: "warn"(默认,仅记录) | "fail"(抛错阻断启动,借鉴 MemPalace fail-closed)
     mental_model: MentalModelConfig = field(default_factory=MentalModelConfig)
     compression: CompressionConfig = field(default_factory=CompressionConfig)
     middleware: MiddlewareConfig = field(default_factory=MiddlewareConfig)

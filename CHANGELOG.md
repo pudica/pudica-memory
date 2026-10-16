@@ -1,5 +1,28 @@
 # Changelog
 
+## v3.5.0 (2026-10-16) — 深度审计升级批次
+
+### P0-1 Embedder 身份校验（借鉴 MemPalace）
+- `chroma_store.py` 加 `EMBEDDER_ID` 常量（`onnx-bge-small-zh-v1.5-dim512`）
+- `main.py` 启动时校验当前 embedder 与入库时是否一致，可配 `embedder_id_mismatch: warn|fail`
+- `sqlite_store.py` SQLitePool 加 `get_config`/`set_config`（存 embedder 身份元数据）
+
+### P0-2 记忆库审计（借鉴 MemPalace `audit`）
+- `tools.py` 新增 `memory_audit` 工具：SQLite 数据层 / Chroma 向量层 / KG 实体层 / Scene 场景层 / L1 提取层，5 层各 0-20 分，总分 100，含 findings + `fail_under` 阈值
+- `http_server.py` 新增 `GET /api/v1/audit` 端点
+
+### P1-3 Recall 决策重排接入（借鉴 Hindsight decision reranker）
+- `_memory_context` 用户召回主链接入 reranker（默认 heuristic，零 LLM 依赖），失败静默回退 RRF 原序
+- 检索结果带 `_reranked` 标记 + 保留 `_rrf_score`
+
+### P1-4 Recency decay 参数化（借鉴 Hindsight）
+- `fusion.py` `fuse()` 加 `recency_decay` 参数，指数半衰期公式 `0.5 ** (days_ago / halflife_days)`，默认 90 天，缺省关闭、向后兼容
+
+### Bug 修复
+- `persona.py`：`get_personas` 对 aiosqlite Row 调 `.get()` 崩溃（被 try/except 吞掉致用户画像恒空），加 `row = dict(row)` 修复
+- `tools.py` `_build_scene_tree`：两处 `JOIN ... ON m.scene_id = s.id` 用的是不存在的列，改 `ON m.wing = s.wing AND m.room = s.room`
+- `tools.py` 5 个 mempalace 兼容工具崩溃：`_mempalace_list_wings/list_rooms/list_drawers/get_drawer/get_taxonomy` 原调用不存在的 `TEMPREngine.*` 方法（TEMPREngine 只有 `search`），全部重写为查 SQLite（scenes/memories 表）
+
 v3.4.2
 
 ### MCP 服务器修复

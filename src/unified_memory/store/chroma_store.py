@@ -24,6 +24,9 @@ from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 _EF_CACHE: dict[str, Any] = {}
 _EF_CACHE_LOCK = threading.Lock()
 _EF_DIMENSION = 512  # BAAI/bge-small-zh-v1.5 输出维度
+# 嵌入式模型身份指纹（v3.4.3: 持久化到 SQLite config，供启动时校验防维度/模型漂移）。
+# 注意：不可用 EmbeddingFunction.name() 作 identity——bge 嵌入器的 name() 恒返回 "default"（chromadb 校验用）。
+EMBEDDER_ID = "onnx-bge-small-zh-v1.5-dim512"
 # Bug fix: ChromaDB 专用线程池，避免与默认 ThreadPoolExecutor 竞争导致死锁
 _CHROMA_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _CHROMA_EXECUTOR_LOCK = threading.Lock()

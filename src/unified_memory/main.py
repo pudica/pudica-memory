@@ -20,7 +20,7 @@ from urllib.parse import urljoin
 import httpx
 
 from unified_memory.config import Config, LLMConfig
-from unified_memory.store.chroma_store import ChromaStore
+from unified_memory.store.chroma_store import ChromaStore, EMBEDDER_ID
 from unified_memory.store.sqlite_store import SQLitePool
 from unified_memory.store.kg import KnowledgeGraph
 from unified_memory.store.mental_models import MentalModelStore
@@ -164,6 +164,25 @@ class UnifiedMemoryApp:
             self.chroma._ensure_collection()
             logger.info("  ChromaDB: %s (collection=%s)", self.config.chroma.persist_dir, self.config.chroma.collection_name)
 
+            # 4a. embedder 身份校验（v3.4.3；借鉴 MemPalace embedder-identity fail-closed）
+            try:
+                stored_id = await self.pool.get_config("embedder_id")
+                if stored_id is None:
+                    await self.pool.set_config("embedder_id", EMBEDDER_ID)
+                    logger.info("  记录 embedder 身份: %s", EMBEDDER_ID)
+                elif stored_id != EMBEDDER_ID:
+                    msg = (f"embedder 身份不匹配: 库记录={stored_id}, 当前={EMBEDDER_ID}。"
+                           "现有向量库可能由其他嵌入模型构建，语义检索结果不可靠！")
+                    logger.warning(msg)
+                    if self.config.embedder_id_mismatch == "fail":
+                        raise RuntimeError(msg)
+                else:
+                    logger.debug("   embedder 身份一致: %s", EMBEDDER_ID)
+            except RuntimeError:
+                raise
+            except Exception as e:  # pool 或 config 表异常不阻断启动，仅告警
+                logger.warning("  embedder 身份校验跳过: %s (不影响启动)", e)
+
             # 4. 知识图谱
             self.kg = KnowledgeGraph(pool=self.pool)
             await self.kg.load_from_db()
@@ -300,6 +319,7 @@ class UnifiedMemoryApp:
             pool=self.pool,
             mental_models=self.mental_models,
             compressor=self.compressor,
+            reranker=self.reranker,
         )
 
         # 自动存取中间件（v3.2）

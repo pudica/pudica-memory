@@ -154,6 +154,16 @@ class HTTPServer:
                 raise HTTPException(status_code=500, detail="system_stats not registered")
             return await handler()
 
+        @app.get("/api/v1/audit")
+        async def audit(fail_under: Optional[float] = None):
+            """跨 5 层健康审计（只读，借鉴 MemPalace audit）。
+            fail_under: 总分低于该阈值时 verdict=fail（供 cron 报警）。
+            """
+            handler = self._get_handler("memory_audit")
+            if handler is None:
+                raise HTTPException(status_code=500, detail="memory_audit not registered")
+            return await handler(fail_under=fail_under)
+
         # ---- mempalace 兼容路由 ----
 
         @app.get("/api/v1/mempalace/wings")

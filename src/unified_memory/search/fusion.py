@@ -17,6 +17,7 @@ v3.1 升级：新增 QueryClassifier，根据查询文本特征动态调整 RRF 
 
 import asyncio
 import re
+import time
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -47,6 +48,7 @@ class RRFusion:
     def fuse(
         self, results: dict, top_k: int = 20,
         weights: Optional[dict[str, float]] = None,
+        recency_decay: Optional[dict] = None,
     ) -> list[FusionResult]:
         """RRF 融合 + 分数归一化。
 
@@ -56,6 +58,10 @@ class RRFusion:
             results: {策略名: [ScoredResult, ...]} 字典
             top_k: 返回条数，默认 20
             weights: 可选权重覆盖（Bug fix: 用于自适应权重，不修改共享状态避免并发问题）
+            recency_decay: 可选全局 recency 衰减配置（默认 None 不启用），
+                形如 {"halflife_days": 90.0, "fallback_days": 30.0}。
+                启用时对融合结果乘指数衰减权重（0.5 ** (days_ago / halflife_days)）后重排，
+                借鉴 Hindsight reranking.py。metadata 缺少 created_at 的条目按 fallback_days 处理。
 
         Returns:
             融合后按 RRF 得分降序排列的 FusionResult 列表
@@ -93,7 +99,7 @@ class RRFusion:
         if max_score <= 0:
             max_score = 1.0
 
-        return [
+        fused = [
             FusionResult(
                 id=doc_id,
                 text="\n".join(info["texts"]),
@@ -103,6 +109,11 @@ class RRFusion:
             )
             for doc_id, info in sorted_items
         ]
+        # 可选的全局 recency 衰减（借鉴 Hindsight reranking.py 的 exponential decay）。
+        # 默认关闭（recency_decay=None 时行为与旧版完全一致）。
+        if recency_decay:
+            fused = apply_recency_decay(fused, **recency_decay)
+        return fused
 
     def interleave(
         self, results: dict[str, list[ScoredResult]], top_k: int = 20
@@ -142,6 +153,46 @@ class RRFusion:
                     if len(fused) >= top_k:
                         return fused
         return fused
+
+
+def apply_recency_decay(
+    results: list[FusionResult],
+    halflife_days: float = 90.0,
+    fallback_days: float = 30.0,
+    now: Optional[float] = None,
+) -> list[FusionResult]:
+    """对 RRF 融合结果应用指数 recency 衰减（借鉴 Hindsight reranking.py）。
+
+    权重 = 0.5 ** (days_ago / halflife_days)，半衰期默认 90 天。
+    只降权，不升权（新记忆系数≈1）；无 created_at 的条目按 fallback_days 处理。
+
+    Args:
+        results: fuse()/interleave() 输出的 FusionResult 列表
+        halflife_days: 半衰期（天），默认 90
+        fallback_days: 缺失 created_at 时按多少天前计，默认 30（不惩罚近期记忆）
+        now: 当前时间戳（epoch 秒），默认 time.time()，便于测试注入
+
+    Returns:
+        按 recency 加权后重新降序排列的新列表（不修改入参对象）。
+    """
+    if not results:
+        return results
+    ts = now if now is not None else time.time()
+    days_per_second = 1.0 / 86400.0
+    # 预计算衰减系数（w 缓存；注意 half-life 变小会更陡）
+    ploghalf = 0.5 ** (1.0 / halflife_days)
+    weighted = list(results)
+    for r in weighted:
+        created = r.metadata.get("created_at") if isinstance(r.metadata, dict) else None
+        if created is None:
+            age_days = fallback_days
+        else:
+            age_days = max(0.0, (ts - created) * days_per_second)
+        # exponential: 0.5 ** (age_days / halflife_days) == ploghalf ** age_days
+        w = ploghalf ** age_days
+        r.score = r.score * w
+    weighted.sort(key=lambda x: x.score, reverse=True)
+    return weighted
 
 
 class QueryClassifier:

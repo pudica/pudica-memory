@@ -94,7 +94,8 @@ class ToolRegistry:
 
     def __init__(self, engine: Any, temp_engine: Any, kg: Any, scheduler: Any,
                  chroma: Any, pool: Any, mental_models: Any = None,
-                 compressor: Any = None, auth: Optional[AuthConfig] = None):
+                 compressor: Any = None, auth: Optional[AuthConfig] = None,
+                 reranker: Any = None):
         self._engine = engine
         self._temp_engine = temp_engine
         self._kg = kg
@@ -103,6 +104,7 @@ class ToolRegistry:
         self._pool = pool
         self._mental_models = mental_models
         self._compressor = compressor
+        self._reranker = reranker
         self._auth = auth or AuthConfig()
         self._tools: dict[str, dict] = {}
         self._register_all()
@@ -154,6 +156,8 @@ class ToolRegistry:
                        "系统健康检查", {}, auth_level="public")
         self._register("system_stats", self._system_stats,
                        "系统统计", {}, auth_level="public")
+        self._register("memory_audit", self._memory_audit,
+                       "跨 5 层健康审计（只读）", {"fail_under": "float (可选)"}, auth_level="public")
 
         # ---- user 级别（需要用户级 API key） ----
         self._register("mempalace_add_drawer", self._mempalace_add_drawer,
@@ -280,29 +284,106 @@ class ToolRegistry:
 
     async def _mempalace_list_wings(self) -> dict:
         """列出所有 wing。"""
-        return {"wings": self._temp_engine.list_wings()}
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cur = await conn.execute(
+                    "SELECT DISTINCT wing FROM scenes WHERE wing IS NOT NULL ORDER BY wing")
+                rows = await cur.fetchall()
+                return {"wings": [dict(r)["wing"] for r in rows]}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _mempalace_list_rooms(self, wing: Optional[str] = None) -> dict:
         """列出 wing 下的 room。"""
-        return {"rooms": self._temp_engine.list_rooms(wing)}
+        try:
+            conn = await self._pool.acquire()
+            try:
+                if wing:
+                    cur = await conn.execute(
+                        "SELECT DISTINCT room FROM scenes WHERE wing = ? AND room IS NOT NULL ORDER BY room",
+                        (wing,))
+                else:
+                    cur = await conn.execute(
+                        "SELECT DISTINCT room FROM scenes WHERE room IS NOT NULL ORDER BY room")
+                rows = await cur.fetchall()
+                return {"rooms": [dict(r)["room"] for r in rows]}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _mempalace_list_drawers(self, wing: Optional[str] = None,
                                       room: Optional[str] = None,
                                       limit: int = 50) -> dict:
-        """列出 drawer。"""
-        return {"drawers": self._temp_engine.list_drawers(wing, room, limit)}
+        """列出 drawer（即记忆片段）。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                sql = ("SELECT id, content, wing, room, source, fact_type, "
+                       "summary, created_at FROM memories WHERE 1=1")
+                args: list = []
+                if wing:
+                    sql += " AND wing = ?"
+                    args.append(wing)
+                if room:
+                    sql += " AND room = ?"
+                    args.append(room)
+                sql += " ORDER BY created_at DESC LIMIT ?"
+                args.append(max(1, int(limit)))
+                cur = await conn.execute(sql, tuple(args))
+                rows = await cur.fetchall()
+                return {"drawers": [dict(r) for r in rows],
+                        "count": len(rows)}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _mempalace_get_drawer(self, id: str) -> dict:
-        """获取单个 drawer。"""
-        return {"drawer": self._temp_engine.get_drawer(id)}
+        """获取单个 drawer（单条记忆详情）。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cur = await conn.execute(
+                    "SELECT id, content, wing, room, source, fact_type, authority, "
+                    "trust_score, summary, created_at, metadata FROM memories WHERE id = ?",
+                    (id,))
+                row = await cur.fetchone()
+                if not row:
+                    return {"error": f"drawer {id} not found"}
+                return {"drawer": dict(row)}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _mempalace_get_taxonomy(self) -> dict:
-        """获取分类。"""
-        return {"taxonomy": self._temp_engine.get_taxonomy()}
+        """获取 wing/room 分类结构。"""
+        try:
+            conn = await self._pool.acquire()
+            try:
+                cur = await conn.execute(
+                    "SELECT DISTINCT wing, room FROM scenes "
+                    "WHERE wing IS NOT NULL ORDER BY wing, room")
+                rows = await cur.fetchall()
+                taxonomy: dict[str, list[str]] = {}
+                for r in rows:
+                    d = dict(r)
+                    w = d.get("wing") or "default"
+                    rm = d.get("room") or "general"
+                    taxonomy.setdefault(w, []).append(rm)
+                return {"taxonomy": taxonomy}
+            finally:
+                await self._pool.release(conn)
+        except Exception as e:
+            return {"error": str(e)}
 
     async def _mempalace_status(self) -> dict:
         """获取系统状态。"""
-        return {"status": self._temp_engine.status()}
+        return await self._system_health()
 
     async def _mempalace_add_drawer(self, wing: str, room: str, content: str) -> dict:
         """写入内容到记忆。"""
@@ -356,9 +437,23 @@ class ToolRegistry:
             更完整的用户认知上下文（类似 TencentDB memory-prompt/composer.ts 的注入模式）。
             """
             memories = await self._temp_engine.search(query, top_k)
+            # P1-3 recall 决策重排（借鉴 Hindsight）：若配了 reranker 则重排，
+            # 失败静默回退 RRF 原序；结果不足 top_k 时用原结果补足（防 final_k 截断丢条）
+            if self._reranker is not None and memories:
+                try:
+                    reranked = await self._reranker.rerank(query, memories)
+                    reranked = reranked[:top_k]
+                    if len(reranked) < len(memories):
+                        # 重排截断或失败部分→补足未重排的尾部，保 top_k 语义
+                        existing = {m.id for m in reranked}
+                        fill = [m for m in memories if m.id not in existing][: top_k - len(reranked)]
+                        reranked = reranked + fill
+                    memories = reranked
+                except Exception as e:
+                    logger.debug("recall 重排失败，回退 RRF 原序: %s", e)
             models = []
             if self._mental_models:
-                models = await self._mental_models.query_by_relevance(query, top_k)
+                models = await self._mental_models.query(query_str=query, top_k=top_k)
 
             # Persona 注入（v3.5.0）：获取用户画像作为上下文
             persona_prompt = ""
@@ -387,6 +482,188 @@ class ToolRegistry:
             result = await self._compressor.compress()
             return {"status": "compressed", "result": result}
         return {"status": "no compressor configured"}
+    async def _memory_audit(self, fail_under: Optional[float] = None) -> dict:
+        """跨 5 层健康审计（借鉴 MemPalace audit）。
+
+        只读聚合，不写库。指标全部查 SQLite/Chroma/KG 真实存储，
+        不使用重启归零的 ingest_count（MCP 子进程独立实例该值恒为 0）。
+
+        fail_under: 总分(0-100)低于该阈值时 verdict=fail（供 cron/CI 报警），
+        默认不判定。
+
+        Returns:
+            {"layers": {每层 score/max 及明细}, "total": 总分,
+             "verdict": "pass"|"fail", "findings": [...], "ts": epoch}
+        """
+        findings: list[dict] = []
+        layers: dict = {}
+        total = 0.0
+
+        # ---------- 1. SQLite 数据层 (20) ----------
+        mem_count = scene_count = l1_count = wing_count = 0
+        oldest = newest = None
+        conn = await self._pool.acquire()
+        try:
+            cur = await conn.execute("SELECT COUNT(*) AS c FROM memories")
+            row = await cur.fetchone()
+            mem_count = row["c"] if row else 0
+            cur = await conn.execute("SELECT COUNT(*) AS c FROM scenes")
+            row = await cur.fetchone()
+            scene_count = row["c"] if row else 0
+            cur = await conn.execute(
+                "SELECT COUNT(*) AS c FROM memories WHERE summary IS NOT NULL AND summary != ''"
+            )
+            row = await cur.fetchone()
+            l1_count = row["c"] if row else 0
+            cur = await conn.execute("SELECT COUNT(DISTINCT wing) AS c FROM memories")
+            row = await cur.fetchone()
+            wing_count = row["c"] if row else 0
+            cur = await conn.execute("SELECT MIN(created_at) AS mn, MAX(created_at) AS mx FROM memories")
+            row = await cur.fetchone()
+            if row:
+                oldest = row["mn"]; newest = row["mx"]
+        finally:
+            await self._pool.release(conn)
+
+        sqlite_score = 0.0
+        if mem_count == 0:
+            findings.append({"layer": "sqlite", "severity": "critical",
+                             "message": "记忆中 SQLite 表为空（0 条），系统无数据可用"})
+        else:
+            sqlite_score += 12.0  # 有数据基础分
+            if scene_count > 0:
+                sqlite_score += 8.0
+            else:
+                findings.append({"layer": "sqlite", "severity": "warn",
+                                 "message": "场景表为空，L2 场景组织未生成"})
+        if mem_count > 0 and scene_count == 0:
+            sqlite_score = min(sqlite_score, 12.0)
+        layers["sqlite"] = {
+            "score": round(sqlite_score, 1), "max": 20.0,
+            "memories": mem_count, "scenes": scene_count,
+            "wings": wing_count,
+            "oldest_created_at": float(oldest) if oldest else None,
+            "newest_created_at": float(newest) if newest else None,
+        }
+        total += sqlite_score
+
+        # ---------- 2. Chroma 向量层 (20) ----------
+        chroma_count = 0
+        try:
+            chroma_count = self._chroma.get_status().get("count", 0)
+        except Exception as e:
+            findings.append({"layer": "chroma", "severity": "critical",
+                             "message": f"无法读取 ChromaDB 状态: {e}"})
+        chroma_score = 0.0
+        if chroma_count == 0:
+            if mem_count > 0:
+                findings.append({"layer": "chroma", "severity": "critical",
+                                 "message": f"ChromaDB 向量库为空(var count=0)但 SQLite 有 {mem_count} 条，"
+                                             "语义检索已降级为纯 BM25，需运行 rebuild_chromadb.py 重建"})
+                # 揪 2026-08-25 向量库空坑
+            else:
+                findings.append({"layer": "chroma", "severity": "warn",
+                                 "message": "ChromaDB 为空（与 SQLite 一致，均无数据）"})
+        else:
+            chroma_score += 12.0
+            if mem_count > 0:
+                ratio = chroma_count / mem_count
+                if ratio >= 0.99:
+                    chroma_score += 8.0
+                elif ratio >= 0.8:
+                    chroma_score += 5.0
+                    findings.append({"layer": "chroma", "severity": "warn",
+                                     "message": f"向量库条数({chroma_count})与记忆条数({mem_count})不匹配"
+                                                f"(ratio={ratio:.0%})，部分记忆缺失向量"})
+                else:
+                    findings.append({"layer": "chroma", "severity": "warn",
+                                     "message": f"向量库条数({chroma_count})远少于记忆条数({mem_count})"
+                                                f"(ratio={ratio:.0%})，语义检索覆盖严重不足"})
+            else:
+                chroma_score += 8.0
+        layers["chroma"] = {"score": round(chroma_score, 1), "max": 20.0,
+                            "vector_count": chroma_count}
+        total += chroma_score
+
+        # ---------- 3. 知识图谱层 (20) ----------
+        kg_score = 0.0
+        kg_entities = kg_relations = type_conflicts = 0
+        if self._kg is not None:
+            try:
+                stats = self._kg.get_stats()
+                kg_entities = stats.get("entities", 0)
+                kg_relations = stats.get("relations", 0)
+            except Exception as e:
+                findings.append({"layer": "kg", "severity": "warn",
+                                 "message": f"无法读取 KG 统计: {e}"})
+            try:
+                conflicts = await self._kg.get_entity_type_conflicts()
+                type_conflicts = len(conflicts) if conflicts else 0
+            except Exception as e:
+                findings.append({"layer": "kg", "severity": "warn",
+                                 "message": f"无法检测 KG 类型冲突: {e}"})
+            if kg_entities > 0:
+                kg_score = 10.0
+                kg_score += 5.0 if kg_relations > 0 else 0.0
+                # 每类冲突扣 5，扣到 0 为止
+                kg_score = max(kg_score - 5.0 * type_conflicts, 0.0)
+                if type_conflicts > 0:
+                    findings.append({"layer": "kg", "severity": "info",
+                                     "message": f"检测到 {type_conflicts} 个实体类型冲突，可运行 kg_merge_conflicts 合并"})
+            else:
+                findings.append({"layer": "kg", "severity": "info",
+                                 "message": "知识图谱为空（无实体），引自信任类记忆才需要"})
+        else:
+            findings.append({"layer": "kg", "severity": "info",
+                             "message": "知识图谱未启用（self._kg 为 None）"})
+        layers["kg"] = {"score": round(kg_score, 1), "max": 20.0,
+                        "entities": kg_entities, "relations": kg_relations,
+                        "type_conflicts": type_conflicts}
+        total += kg_score
+
+        # ---------- 4. 场景组织层 (20) ----------
+        scene_score = 0.0
+        if mem_count > 0 and scene_count > 0:
+            scene_score += 10.0  # 有场景表
+            if wing_count > 1:
+                scene_score += 10.0
+            else:
+                findings.append({"layer": "scene", "severity": "warn",
+                                 "message": "所有记忆仅分布在 1 个 wing，场景层级未有效组织"})
+        elif mem_count > 0:
+            findings.append({"layer": "scene", "severity": "warn",
+                             "message": "有记忆但场景表为空，L2 场景组织未生效"})
+        layers["scene"] = {"score": round(scene_score, 1), "max": 20.0,
+                           "scenes": scene_count, "wings": wing_count}
+        total += scene_score
+
+        # ---------- 5. L1 提取层 (20) ----------
+        l1_ratio = (l1_count / mem_count) if mem_count > 0 else 0.0
+        l1_score = round(l1_ratio * 20.0, 1)
+        if mem_count > 0 and l1_ratio < 0.5:
+            findings.append({"layer": "l1", "severity": "warn",
+                             "message": f"L1 提取覆盖率仅 {l1_ratio:.0%}（{l1_count}/{mem_count}），"
+                                         "实体/权威标注不足，可运行 scripts/l1_replay_all.py 回放"})
+        layers["l1"] = {"score": l1_score, "max": 20.0,
+                        "extracted": l1_count, "total": mem_count,
+                        "coverage_ratio": round(l1_ratio, 3)}
+        total += l1_score
+
+        total = round(total, 1)
+        verdict = "pass"
+        if fail_under is not None and fail_under > 0 and total < fail_under:
+            verdict = "fail"
+            findings.append({"layer": "audit", "severity": "critical",
+                             "message": f"总分 {total} 低于 fail_under={fail_under}"})
+        return {
+            "layers": layers,
+            "total": total,
+            "max_total": 100.0,
+            "verdict": verdict,
+            "fail_under": fail_under,
+            "findings": findings,
+            "ts": time.time(),
+        }
 
     async def _system_health(self) -> dict:
         """系统健康检查。"""
@@ -449,9 +726,20 @@ class ToolRegistry:
         if not self._mental_models:
             return {"error": "mental models not available"}
         if key:
-            model = self._mental_models.get_by_key(key)
+            # get_belief 需要 category + key；仅给 key 时回退到全量按 key 过滤
+            if category:
+                model = await self._mental_models.get_belief(category, key)
+            else:
+                model = next(
+                    (b for b in await self._mental_models.get_all_beliefs()
+                     if b.key == key),
+                    None,
+                )
             return {"mental_model": model}
-        models = self._mental_models.list_by_category(category) if category else self._mental_models.list_all()
+        models = (
+            await self._mental_models.get_beliefs_by_category(category)
+            if category else await self._mental_models.get_all_beliefs()
+        )
         return {"mental_models": models}
 
     async def _verbatim_recall(self, query: str, limit: int = 5) -> dict:
@@ -530,14 +818,14 @@ class ToolRegistry:
         """检测 KG 实体 type 冲突。"""
         if not self._kg:
             return {"error": "KG not available"}
-        conflicts = await self._kg.detect_type_conflicts()
+        conflicts = await self._kg.get_entity_type_conflicts()
         return {"conflicts": conflicts}
 
     async def _kg_merge_conflicts(self, dry_run: bool = True) -> dict:
         """合并 KG 实体 type 冲突。"""
         if not self._kg:
             return {"error": "KG not available"}
-        result = await self._kg.merge_type_conflicts(dry_run=dry_run)
+        result = await self._kg.merge_entity_conflicts(dry_run=dry_run)
         return {"result": result}
 
     async def _scene_list(self, limit: int = 20, offset: int = 0) -> dict:
@@ -765,7 +1053,7 @@ class ToolRegistry:
                                   s.created_at, s.updated_at,
                                   COUNT(m.id) AS memory_count
                            FROM scenes s
-                           LEFT JOIN memories m ON m.scene_id = s.id
+                           LEFT JOIN memories m ON m.wing = s.wing AND m.room = s.room
                            WHERE s.wing = ?
                            GROUP BY s.id
                            ORDER BY s.wing, s.room, s.created_at DESC
@@ -778,7 +1066,7 @@ class ToolRegistry:
                                   s.created_at, s.updated_at,
                                   COUNT(m.id) AS memory_count
                            FROM scenes s
-                           LEFT JOIN memories m ON m.scene_id = s.id
+                           LEFT JOIN memories m ON m.wing = s.wing AND m.room = s.room
                            GROUP BY s.id
                            ORDER BY s.wing, s.room, s.created_at DESC
                            LIMIT ?""",

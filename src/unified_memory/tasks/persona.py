@@ -588,6 +588,8 @@ class PersonaDistiller:
             rows = await cursor.fetchall()
             results = []
             for row in rows:
+                # aiosqlite 返回 sqlite3.Row 无 .get 方法, 先转 dict 才能安全用 .get
+                row = dict(row)
                 conf = row.get("confidence", "low")
                 if confidence_levels.get(conf, 0) >= min_level:
                     results.append({
